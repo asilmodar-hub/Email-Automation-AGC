@@ -77,7 +77,7 @@ def sheet(wb, rows):
     return ws
 
 
-def template():
+def template(out=None):
     wb = openpyxl.Workbook()
     sheet(wb, [
         ["Herr", "Dr.", "Max", "Mustermann", "Mustermann & Partner Rechtsanwälte", "Partner, M&A", "Law firm",
@@ -87,7 +87,7 @@ def template():
          "erika@consulting.example", "EN", "du", "", "Met at a conference in Vienna, 2024",
          "Industrial services", "", "yearly", "", ""],
     ])
-    out = os.path.join(ROOT, "agc-deal-flow-outreach", "assets", "Contacts_Template.xlsx")
+    out = out or os.path.join(ROOT, "agc-deal-flow-outreach", "assets", "Contacts_Template.xlsx")
     wb.save(out)
     return out
 

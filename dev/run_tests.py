@@ -547,6 +547,50 @@ def a_restart_picks_up_an_unfinished_round():
         httpd.shutdown()
 
 
+@test
+def the_app_starts_under_the_tools_own_python():
+    """The private Python the setup installs does not put a script's own folder
+    on the path, so a script that imports its neighbours without saying where
+    they are does not start. -I gives any Python the same blind spot; where the
+    private Python is installed on this computer, it is tried as well."""
+    import subprocess
+    scripts = os.path.join(ROOT, "agc-deal-flow-outreach", "scripts")
+    pythons = [[sys.executable, "-I"]]
+    private = os.path.join(os.environ.get("LOCALAPPDATA", ""), "AGC-DealFlow", "runtime", "python.exe")
+    if os.path.exists(private):
+        pythons.append([private])
+    for python in pythons:
+        home = tempfile.mkdtemp(prefix="start-", dir=TMP)
+        env = dict(os.environ, AGC_OUTREACH_FAKE="1", AGC_OUTREACH_HOME=home)
+        for name in ("AGC_OUTREACH_PORT", "AGC_OUTREACH_TOKEN"):
+            env.pop(name, None)
+        run = lambda *args: subprocess.run(python + list(args), env=env, capture_output=True, text=True, timeout=90)
+
+        ready = run(os.path.join(scripts, "preflight.py"), "--quiet")
+        assert ready.returncode == 0 and "Traceback" not in ready.stderr, (python, ready.stdout, ready.stderr)
+
+        app = subprocess.Popen(python + [os.path.join(scripts, "server.py")], env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+        try:
+            info = os.path.join(home, "server.json")
+            for _ in range(80):
+                if os.path.exists(info) or app.poll() is not None:
+                    break
+                time.sleep(0.25)
+            assert app.poll() is None and os.path.exists(info), (python, app.stderr.read() if app.poll() is not None else "no server.json")
+            status = run(os.path.join(scripts, "outreach.py"), "status")
+            assert "Running at" in status.stdout and "tester@agcapital.example" in status.stdout, (python, status.stdout, status.stderr)
+        finally:
+            run(os.path.join(scripts, "outreach.py"), "stop")
+            try:
+                app.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                app.kill()
+            # the pipes must be closed before the folder can be removed on Windows
+            app.stdout.close()
+            app.stderr.close()
+
+
 def clean_slate():
     """Empty the folder next to the list, so the next test starts with everyone due."""
     folder = store.data_dir(store.load_settings()["workbook"])

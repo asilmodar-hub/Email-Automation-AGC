@@ -1,6 +1,9 @@
 # the simulated demo's working folder (settings, fake mailbox, rounds)
 dev/tmp/
 
+# what the tool keeps next to a contact list it was pointed at
+Deal Flow Outreach data/
+
 # Python
 __pycache__/
 *.pyc

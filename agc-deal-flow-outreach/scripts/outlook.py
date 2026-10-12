@@ -28,6 +28,7 @@ FAKE = os.environ.get("AGC_OUTREACH_FAKE") == "1"
 OL_MAIL_ITEM = 0
 OL_FOLDER_OUTBOX, OL_FOLDER_INBOX = 4, 6
 OL_DISCARD = 1
+OL_MINIMIZED = 1
 
 QUOTE_MARKERS = [
     r"^-{3,}\s*(original message|ursprüngliche nachricht|ursprüngliche nachricht)",
@@ -123,6 +124,30 @@ def _plain(exc):
     return (m.group(1) if m else text).strip()[:200]
 
 
+def _code(exc):
+    """Outlook's own error number, as IT would look it up, or ''."""
+    for value in (getattr(exc, "excepinfo", None) or (None,) * 6)[5:6] + (getattr(exc, "hresult", None),):
+        if isinstance(value, int) and value:
+            return "0x%08X" % (value & 0xFFFFFFFF)
+    return ""
+
+
+class SendRefused(Exception):
+    """Outlook would not do one of the steps of sending. Says which, and why."""
+
+    def __init__(self, step, exc):
+        self.step, self.code, self.reason = step, _code(exc), _plain(exc)
+        hint = {
+            # what Outlook answers when a program is not allowed to send on the user's behalf
+            "0x80004004": " Outlook did not allow a program to send for you. That is a security setting of "
+                          "your organisation; IT can allow it.",
+            "0x80070005": " Outlook did not allow a program to send for you. That is a security setting of "
+                          "your organisation; IT can allow it.",
+        }.get(self.code, "")
+        super().__init__("Outlook refused to %s: %s%s%s" % (step, self.reason, " (%s)" % self.code if self.code else "",
+                                                            hint))
+
+
 def _when(value):
     """Outlook hands back local time labelled as UTC; take the clock reading."""
     return dt.datetime(value.year, value.month, value.day, value.hour, value.minute, value.second)
@@ -153,15 +178,53 @@ def _in_outbox(ns, to, subject):
     return False
 
 
-def _send(w, to, subject, body):
-    app, ns = w.connect()
+def _show_outlook(app, ns):
+    """Make sure Outlook has a window. Started in the background by a program,
+    Outlook has none, and in that state it often refuses to send or leaves mail
+    lying in the Outbox. Opened minimised, so it does not jump in front."""
+    if app.Explorers.Count:
+        return False
+    ns.GetDefaultFolder(OL_FOLDER_INBOX).Display()
+    for _ in range(20):                       # the window takes a moment to exist
+        if app.Explorers.Count:
+            break
+        time.sleep(0.25)
+    try:
+        app.ActiveExplorer().WindowState = OL_MINIMIZED
+    except Exception:
+        pass
+    return True
+
+
+def _throw_away(mail, saved):
+    """Leave nothing behind from an email that did not go out. A draft that
+    was saved goes to Deleted Items, where it can still be found; an unsaved
+    one simply disappears."""
+    try:
+        if saved:
+            mail.Delete()
+        else:
+            mail.Close(OL_DISCARD)
+    except Exception:
+        pass
+
+
+def _attempt(app, to, subject, body, in_window):
+    """Build one email and send it. in_window opens the email's own window
+    first, the way a person composes; the quiet way does not show anything."""
+    step, saved = "create the email", False
     mail = app.CreateItem(OL_MAIL_ITEM)
     try:
+        step = "address the email"
         mail.To = to
         mail.Subject = subject
+        step = "put the text above your signature"
         combined = None
         try:
-            _ = mail.GetInspector            # makes Outlook put the default signature in
+            if in_window:
+                mail.Display(False)
+            else:
+                _ = mail.GetInspector        # makes Outlook put the default signature in
             combined = insert_above_signature(mail.HTMLBody or "", body)
         except Exception:
             combined = None
@@ -169,21 +232,38 @@ def _send(w, to, subject, body):
             mail.HTMLBody = combined
         else:
             mail.Body = body
+        step = "accept the address %s" % to
         if not mail.Recipients.ResolveAll():
-            raise ValueError("Outlook does not accept the address %s" % to)
+            raise ValueError("Outlook does not know this address")
+        step = "save the email"
         mail.Save()
+        saved = True
         conversation = ""
         try:
             conversation = mail.ConversationID or ""
         except Exception:
             pass
+        step = "send the email"
         mail.Send()
-    except Exception:
+        return conversation
+    except Exception as exc:
+        _throw_away(mail, saved)
+        raise SendRefused(step, exc)
+
+
+def _send(w, to, subject, body):
+    app, ns = w.connect()
+    _show_outlook(app, ns)
+    try:
+        conversation = _attempt(app, to, subject, body, in_window=False)
+    except SendRefused as first:
+        if first.step != "send the email" or first.code in ("0x80004004", "0x80070005"):
+            raise                 # a wrong address or a security refusal does not get better by asking twice
+        # Some setups only send an email that was open in its own window.
         try:
-            mail.Close(OL_DISCARD)
-        except Exception:
-            pass
-        raise
+            conversation = _attempt(app, to, subject, body, in_window=True)
+        except SendRefused:
+            raise first
     # Sent only counts once the email has left the Outbox. Outlook started in the
     # background sometimes holds mail there until it is told to send.
     left = False
@@ -328,6 +408,8 @@ def send(to, subject, body):
         return _fake_send(to, subject, body)
     try:
         return call(_send, to, subject, body)
+    except SendRefused as exc:
+        raise RuntimeError(str(exc))
     except Exception as exc:
         raise RuntimeError(_plain(exc))
 

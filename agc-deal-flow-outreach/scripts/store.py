@@ -22,7 +22,7 @@ import os
 import re
 import tempfile
 
-VERSION = "1.0"
+VERSION = "1.1"
 DATA_FOLDER_NAME = "Deal Flow Outreach data"
 
 DEFAULT_SETTINGS = {

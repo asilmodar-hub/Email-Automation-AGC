@@ -37,18 +37,32 @@ dialog and progress, the tracker.
 **The command path Claude uses** (`start`, `wait`, `submit`, `status`, `stop`,
 `start --scheduled`), including refused results and a stopped app.
 
-**Real classic Outlook, read-only**, on the development machine: the mailbox
-identity is read without a security prompt and the default signature loads
-into a new email.
+**Real classic Outlook, without sending**, on the development machine: the
+mailbox identity is read without a security prompt, and every step of sending
+up to the last one passes, both quietly and in the email's own window
+(`python dev/outlook_dryrun.py`; nothing is saved or sent).
+
+**The first-run setup**, once, on the development machine, by installing the
+skill in Claude and calling it: the private Python and the packages were
+installed. That run showed the app then failed to start, because the private
+Python did not find the app's own modules. Fixed in 1.1, and now covered by a
+test that starts the app the same way.
 
 ## What has not been tested
 
-- **Sending through real Outlook.** The development machine's mailbox is not
-  an AGC one, so no real email was sent. Everything in "Pilot" below is open.
+- **Sending through real Outlook has not worked yet.** One real attempt, on
+  the development machine with a mailbox that is not an AGC one, was refused
+  by Outlook at the very last step with "The parameter is incorrect". The
+  cause is not established: Outlook had no window open at the time, and that
+  machine's Outlook security is set by company policy. Since then (1.1) the
+  tool opens Outlook's window before sending, tries a second time in the
+  email's own window, removes the draft of an email that did not go out, and
+  reports which step Outlook refused and with which error number. None of that
+  has been confirmed by an email actually leaving. Everything in "Pilot" below
+  is open.
 - **Reading real answers** from a real inbox.
-- **The first-run setup** (`setup.cmd`) that installs the tool's own Python.
-  It is adapted from the deal-model skill's setup, which works, but this copy
-  has not been run.
+- **The first-run setup on a restricted network.** It needs python.org and
+  pypi.org; where those are blocked it stops with a message for IT.
 - **A live scheduled run** through the Claude app's scheduler.
 - **The Windows notification** on a scheduled run.
 

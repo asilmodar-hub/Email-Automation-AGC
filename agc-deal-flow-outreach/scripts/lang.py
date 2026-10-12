@@ -123,6 +123,21 @@ def _n(count, one, many):
     return (one if int(count) == 1 else many) % int(count)
 
 
+_STEPS = {
+    "create the email": "die E-Mail anzulegen",
+    "address the email": "die E-Mail zu adressieren",
+    "put the text above your signature": "den Text über Ihre Signatur zu setzen",
+    "save the email": "die E-Mail zu speichern",
+    "send the email": "die E-Mail zu senden",
+}
+
+
+def _step(text):
+    if text.startswith("accept the address "):
+        return "die Adresse %s anzunehmen" % text[len("accept the address "):]
+    return _STEPS.get(text, text)
+
+
 def _sent(m, where):
     text = _n(m.group(1), "%d E-Mail", "%d E-Mails") + " " + where + " gesendet."
     if m.group("failed"):
@@ -178,6 +193,12 @@ PATTERNS = [(re.compile(p, re.DOTALL), f) for p, f in [
      lambda m: _n(m.group(1), "%d neue Antwort gefunden.", "%d neue Antworten gefunden.")),
     (r"^The inbox could not be read: (.*)$", lambda m: "Der Posteingang konnte nicht gelesen werden: %s" % m.group(1)),
     (r"^The request is missing (.*)\.$", lambda m: "In der Anfrage fehlt %s." % m.group(1)),
+    (r"^Outlook refused to (?P<step>.*?): (?P<why>.*?)(?P<it> Outlook did not allow a program to send for you\. "
+     r"That is a security setting of your organisation; IT can allow it\.)?$",
+     lambda m: "Outlook hat sich geweigert, %s: %s%s" % (
+         _step(m.group("step")), m.group("why"),
+         " Outlook hat einem Programm nicht erlaubt, in Ihrem Namen zu senden. Das ist eine "
+         "Sicherheitseinstellung Ihrer Organisation; die IT kann es freigeben." if m.group("it") else "")),
 ]]
 
 

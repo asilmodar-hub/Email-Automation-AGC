@@ -10,7 +10,13 @@ Exit codes:
     2  not usable, a package is missing
 """
 import importlib
+import os
 import sys
+
+# The tool's private Python does not put a script's own folder on the path.
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 PACKAGES = [
     ("openpyxl", "reads the contact list and writes the tracker export"),

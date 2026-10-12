@@ -28,15 +28,20 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-import checks
-import contacts as contacts_mod
-import lang
-import outlook
-import schedule
-import store
+# The tool's private Python does not put a script's own folder on the path, so
+# the modules beside this file are not found unless we say where they are.
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import checks  # noqa: E402
+import contacts as contacts_mod  # noqa: E402
+import lang  # noqa: E402
+import outlook  # noqa: E402
+import schedule  # noqa: E402
+import store  # noqa: E402
 
 VERSION = store.VERSION
-HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(os.path.dirname(HERE), "assets")
 UI_DIR = os.path.join(ASSETS, "ui")
 
@@ -1055,5 +1060,4 @@ def run():
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, HERE)
     run()

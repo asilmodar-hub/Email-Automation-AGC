@@ -1,0 +1,9 @@
+# the simulated demo's working folder (settings, fake mailbox, rounds)
+dev/tmp/
+
+# Python
+__pycache__/
+*.pyc
+
+# Excel lock files
+~$*

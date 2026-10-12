@@ -1,0 +1,7 @@
+# Batch files must keep their Windows line endings wherever they are checked
+# out or downloaded: with Unix endings cmd.exe misreads labels and goto.
+*.cmd -text
+
+*.skill binary
+*.xlsx binary
+*.png binary

@@ -6,6 +6,7 @@ Two places:
       settings.json       everything set in the UI, saved on every change
       server.json         where the running app listens (port, token)
       jobs\\               work handed to Claude and what came back
+      attachments\\        files to go out with the emails, one folder each
 
   next to the contact list   <workbook folder>\\Deal Flow Outreach data
       rounds\\<round>__<sender>.json    one file per round and sender
@@ -22,13 +23,21 @@ import os
 import re
 import tempfile
 
-VERSION = "1.1"
+VERSION = "1.2"
 DATA_FOLDER_NAME = "Deal Flow Outreach data"
 
 DEFAULT_SETTINGS = {
     "language": "en",            # the screen's language: en | de
+    "theme": "system",           # light | dark | system (follows Windows)
     "workbook": "",
     "owner_name": "",            # how this user appears in the Owner column
+    "owner_code": "",            # their short form in AGC's Zuständigkeit column, e.g. VK
+    "unassigned_mine": None,     # a contact nobody is responsible for counts as this user's (None: decided by the list)
+    "filters": {                 # who this user writes to, on top of what is due
+        "countries": [], "states": [], "priorities": [], "relevance": [], "types": [],
+    },
+    "personalize": True,         # Claude adjusts each email to what the list says about the person
+    "sync_forms": True,          # writing the Sie version has Claude write the du version, and back
     "batch_size": 50,
     "gap_min_seconds": 20,
     "gap_max_seconds": 40,
@@ -43,6 +52,11 @@ DEFAULT_SETTINGS = {
     # master emails, keyed de_sie | de_du | en and fu_de_sie | fu_de_du | fu_en
     # (follow-ups); filled from assets\templates the first time the app starts
     "templates": {},
+    # which German version Claude wrote from which: {key: {from, hash, at}}
+    "template_sync": {},
+    # files that go out with every email of a round: {round: [...], followup: [...]},
+    # each {id, name, size}; the file itself is in attachments\<id>\<name>
+    "attachments": {"round": [], "followup": []},
 }
 
 
@@ -101,7 +115,7 @@ def slug(text):
 def _merge(base, extra):
     out = dict(base)
     for key, value in (extra or {}).items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
+        if isinstance(value, dict) and isinstance(out.get(key), dict) and key != "attachments":
             out[key] = _merge(out[key], value)
         else:
             out[key] = value
@@ -143,6 +157,43 @@ def data_dir(workbook):
         fallback = os.path.join(home(), "data", key)
         os.makedirs(os.path.join(fallback, "rounds"), exist_ok=True)
         return fallback
+
+
+# ---- attachments ---------------------------------------------------------------
+
+ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
+
+
+def attachments_dir():
+    path = os.path.join(home(), "attachments")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def safe_name(name):
+    """A file name Windows accepts, without any folder in it."""
+    name = os.path.basename(str(name or "").replace("\\", "/")).strip().strip(".")
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    return name[:120] or "attachment"
+
+
+def add_attachment(name, data):
+    """Keep a copy of the file in the user's own folder. Returns {id, name, size}."""
+    if len(data) > ATTACHMENT_MAX_BYTES:
+        raise ValueError("too large")
+    att_id = hashlib.sha1(data).hexdigest()[:12]
+    name = safe_name(name)
+    folder = os.path.join(attachments_dir(), att_id)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    if not os.path.exists(path):
+        with open(path, "wb") as fh:
+            fh.write(data)
+    return {"id": att_id, "name": name, "size": len(data)}
+
+
+def attachment_path(att):
+    return os.path.join(attachments_dir(), safe_name(att.get("id", "")), safe_name(att.get("name", "")))
 
 
 def round_path(folder, round_id, sender):

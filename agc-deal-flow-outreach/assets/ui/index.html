@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#ffffff">
 <title>Deal Flow Outreach</title>
+<script>
+  // the theme before anything is drawn, so a dark screen does not flash white
+  (function () {
+    var pick = "system";
+    try { pick = localStorage.getItem("agc-theme") || "system"; } catch (e) {}
+    var dark = pick === "dark" || (pick === "system" && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  })();
+</script>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -21,6 +30,7 @@
 <main id="main" tabindex="-1"><p class="loading">Starting…</p></main>
 <div id="modal"></div>
 <div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="filepick" multiple hidden>
 <script src="de.js"></script>
 <script src="app.js"></script>
 </body>

@@ -8,17 +8,23 @@ The division of labour is deliberate:
 
   the screen    every decision: which list, which contacts, what is approved,
                 when to send
-  Claude        changing one email when the reviewer asks, and reading the answers
+  Claude        adjusting each email to what the list says about the person,
+                changing one email when the reviewer asks, writing the du
+                version of a Sie master email (and back), looking up a missing
+                address online, and reading the answers
   this app      everything mechanical, and the only place an email is sent from
 
 Sending starts in exactly one way: POST /api/send from the screen's Send
 button. There is no job type, command or other route that sends.
 """
+import base64
 import datetime as dt
+import hashlib
 import io
 import json
 import os
 import random
+import re
 import secrets
 import subprocess
 import sys
@@ -50,6 +56,28 @@ CLAUDE_SEEN_WITHIN = 45
 OUTCOMES = ["lead", "referral", "later", "decline", "out_of_office", "bounce", "do_not_contact",
             "unrelated"]
 TEMPLATE_KEYS = list(checks.TEMPLATE_KEYS) + ["fu_" + k for k in checks.TEMPLATE_KEYS]
+# The two German versions of a master email are kept in step: whichever was
+# written last, Claude writes the other from it.
+COUNTERPART = {"de_sie": "de_du", "de_du": "de_sie", "fu_de_sie": "fu_de_du", "fu_de_du": "fu_de_sie"}
+# The note to fill in that the first starter emails carried. A saved master
+# email that still has it gets the sentence that replaced it.
+OLD_NOTES = {
+    "[[ein Satz dazu, wonach AGC sucht: Größe, Branchen, Region, Situation]]":
+        "mittelständische Unternehmen im deutschsprachigen Raum, oft in einer Nachfolgesituation oder wenn ein "
+        "Eigentümer einen Partner für den nächsten Schritt sucht",
+    "[[one sentence on what AGC looks for: size, sectors, region, situation]]":
+        "mid-sized companies in the German-speaking countries, often where a succession is open or an owner is "
+        "looking for a partner for the next step",
+}
+# what Claude is given about a contact: the row, as the list has it
+CONTACT_FIELDS = ("first", "last", "title", "gender", "company", "role", "department", "type", "language", "form",
+                  "relationship", "sector", "notes", "todos", "city", "region", "country", "state", "postcode",
+                  "address", "phone", "website", "priority", "relevance", "first_contact_date", "owner", "others",
+                  "comments", "extra", "sheet", "row", "email", "last_sent", "last_outcome", "last_summary")
+# what the screen needs of each contact on the Contacts tab
+SCREEN_FIELDS = ("id", "row", "sheet", "first", "last", "title", "company", "role", "type", "type_guessed", "email",
+                 "language", "form", "owner", "country", "state", "city", "region", "priority", "relevance",
+                 "research", "included", "reason", "locked", "assumed", "last_sent", "problems")
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
 
@@ -62,8 +90,34 @@ SCHEDULED_PROMPT = (
     "which case the app does it on its own.")
 
 
+def _tally(values):
+    out = {}
+    for v in values:
+        v = "multi" if v == "MULTI" else v
+        out[v] = out.get(v, 0) + 1
+    return out
+
+
+def answered(d):
+    """Has this person given their first answer? An absence note is not one."""
+    reply = d.get("reply") or {}
+    return bool(d.get("pending_reply")) or bool(reply.get("outcome") and reply["outcome"] != "out_of_office")
+
+
 class Problem(Exception):
     """Something the person at the screen should be told in a sentence."""
+
+
+def EMAIL_OK(address):
+    return bool(address) and bool(contacts_mod.EMAIL_RE.match(address))
+
+
+def text_hash(*parts):
+    return hashlib.sha1("\n\x00".join(str(p or "") for p in parts).encode("utf-8")).hexdigest()[:16]
+
+
+def contact_for_claude(c):
+    return {k: c.get(k, "") for k in CONTACT_FIELDS}
 
 
 def _starter_templates():
@@ -87,6 +141,15 @@ class App:
         missing = {k: v for k, v in _starter_templates().items() if k not in self.settings["templates"]}
         if missing:
             self.settings = store.save_settings({"templates": missing})
+        noted = {}
+        for key, tpl in self.settings["templates"].items():
+            body = tpl.get("body", "")
+            for note, sentence in OLD_NOTES.items():
+                body = body.replace(note, sentence)
+            if body != tpl.get("body", ""):
+                noted[key] = dict(tpl, body=body)
+        if noted:
+            self.settings = store.save_settings({"templates": noted})
         self.identity = {"ok": False, "email": "", "name": "", "problem": "Checking Outlook…",
                          "checking": True}
         self.book = None            # result of contacts.read_workbook
@@ -117,6 +180,13 @@ class App:
             if ident.get("ok") and not self.settings.get("owner_name"):
                 guess = ident["email"].split("@")[0].replace(".", " ").replace("_", " ").title()
                 self.settings = store.save_settings({"owner_name": guess})
+            if ident.get("ok") and not self.settings.get("owner_code"):
+                # "Vsevolod Kornilov" is VK in the Zuständigkeit column
+                known = set((self.book or {}).get("owners") or {})
+                code = contacts_mod.code_for(ident.get("name") or self.settings.get("owner_name", ""),
+                                             ident["email"], known)
+                if code:
+                    self.settings = store.save_settings({"owner_code": code})
         if ident.get("ok"):
             self.recover()
 
@@ -163,7 +233,13 @@ class App:
                                                         "Look in Sent Items before sending it again.")
                 for d in rnd["drafts"]:
                     if d["status"] == "waiting":
-                        self._queue_rewrite(rnd, d)
+                        self._fetch_and_rewrite(rnd, d)
+                preparing = [d for d in rnd["drafts"] if d["status"] == "preparing"]
+                if preparing:
+                    self._queue_personalize(rnd, preparing)
+                looking = [d for d in rnd["drafts"] if d["status"] == "research"]
+                if looking:
+                    self._queue_research(rnd, looking)
                 store.save_round(self.folder, rnd)
 
     def me(self):
@@ -201,12 +277,15 @@ class App:
 
     # ---- jobs for Claude ------------------------------------------------------
 
-    def add_job(self, kind, payload, replace=False):
+    def add_job(self, kind, payload, replace=False, key=""):
+        """replace: a queued job of the same type (and the same key, if one is
+        given) is dropped, because this one supersedes it."""
         with self.lock:
             if replace:
-                self.jobs = [j for j in self.jobs if not (j["type"] == kind and j["status"] == "queued")]
+                self.jobs = [j for j in self.jobs if not (j["type"] == kind and j["status"] == "queued"
+                                                          and j.get("key", "") == key)]
             job = {"id": uuid.uuid4().hex[:8], "type": kind, "status": "queued", "created": store.stamp(),
-                   "payload": payload, "done": 0, "total": payload.get("count", 1), "error": ""}
+                   "payload": payload, "done": 0, "total": payload.get("count", 1), "error": "", "key": key}
             self.jobs.append(job)
             self.job_ready.notify_all()
             return job
@@ -238,6 +317,36 @@ class App:
         job["status"] = "failed" if error else "done"
         job["error"] = error
 
+    def give_up(self, job, reason):
+        """Claude could not do a job: whatever waits on it goes back to the reviewer."""
+        self.finish_job(job, reason)
+        p = job["payload"]
+        try:
+            rnd = self.find_round(p["round_id"]) if p.get("round_id") else None
+        except Problem:
+            rnd = None
+        if rnd is None:
+            return
+        if job["type"] == "rewrite":
+            draft = next((d for d in rnd["drafts"] if d["contact_id"] == p["contact_id"]), None)
+            if draft is not None and draft["status"] == "waiting":
+                draft["status"] = "pending"
+                name = " ".join(filter(None, [draft["contact"].get("first"), draft["contact"].get("last")]))
+                self.notice = "Claude could not change the email for %s: %s" % (name or draft["to"], reason)
+        elif job["type"] == "personalize":
+            for d in rnd["drafts"]:
+                if d["status"] == "preparing":
+                    d["status"] = "pending"
+            self._after_preparing(rnd)
+        elif job["type"] == "research":
+            for d in rnd["drafts"]:
+                if d["status"] == "research":
+                    d["status"] = "pending"
+                    d["research"] = dict(d.get("research") or {}, status="nothing",
+                                         found={"note": reason}, accepted=False)
+        self.recheck(rnd)
+        store.save_round(self.folder, rnd)
+
     # ---- a round --------------------------------------------------------------
 
     def start_round(self, kind="round", parent=None):
@@ -266,20 +375,33 @@ class App:
                               if k.startswith(prefix) and k[len(prefix):] in checks.TEMPLATE_KEYS},
                 "drafts": [],
             }
+            attachments = (self.settings.get("attachments") or {}).get("followup" if kind == "followup" else "round") or []
+            personalize = bool(self.settings.get("personalize", True))
             for c in people:
                 key = checks.template_key(c)
                 standard = checks.assemble(rnd["templates"].get(key, {}).get("body", ""), c)
+                needs = list(c.get("research") or []) if kind != "followup" else []
+                status = "research" if needs else ("preparing" if personalize else "pending")
+                c = {k: v for k, v in c.items() if k not in ("included", "reason", "locked")}
                 rnd["drafts"].append({
-                    "contact_id": c["id"], "contact": c, "to": c["email"], "template": key,
-                    "subject": rnd["templates"].get(key, {}).get("subject", ""),
-                    "body": standard, "standard": standard, "changed_by": "", "note": "",
-                    "status": "pending", "checks": [], "level": "ok", "sent_at": "",
+                    "contact_id": c["id"], "contact": c, "to": c["email"] if EMAIL_OK(c["email"]) else "",
+                    "template": key, "subject": rnd["templates"].get(key, {}).get("subject", ""),
+                    "body": standard, "standard": standard, "greeting": "", "changed_by": "", "note": "",
+                    "status": status, "checks": [], "level": "ok", "sent_at": "",
                     "conversation_id": "", "error": "", "reply": None, "seen": [],
+                    "attachments": [dict(a) for a in attachments],
+                    "research": {"needed": needs, "status": "waiting"} if needs else None,
                 })
             self.recheck(rnd)
             self.rounds.insert(0, rnd)
             store.save_round(self.folder, rnd)
             self.overrides = {}
+            preparing = [d for d in rnd["drafts"] if d["status"] == "preparing"]
+            if preparing:
+                self._queue_personalize(rnd, preparing)
+            looking = [d for d in rnd["drafts"] if d["status"] == "research"]
+            if looking:
+                self._queue_research(rnd, looking)
             return rnd
 
     def followup_days(self):
@@ -303,27 +425,209 @@ class App:
                 out.append(dict(d["contact"], last_sent=d["sent_at"]))
         return out
 
-    def _queue_rewrite(self, rnd, draft):
+    def _fetch_and_rewrite(self, rnd, draft):
+        """Look up what was written with this address before (the reviewer may
+        refer to it: "mention the email from two weeks ago"), then hand the
+        change to Claude. Outlook is read outside the lock: it can take a while."""
+        address = draft.get("to") or draft["contact"].get("email", "")
+
+        def work():
+            history = outlook.history(address) if address else []
+            with self.lock:
+                if draft.get("status") == "waiting":
+                    self._queue_rewrite(rnd, draft, history)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _queue_rewrite(self, rnd, draft, history=()):
         """Ask Claude to change one email the way the reviewer's note says."""
         c = draft["contact"]
         self.add_job("rewrite", {
             "round_id": rnd["id"], "kind": rnd["kind"], "count": 1,
             "sender": {"name": rnd["sender_name"], "email": rnd["sender"]},
             "contact_id": draft["contact_id"], "note_from_user": draft.get("note", ""),
-            "greeting": contacts_mod.greeting(c)[0], "subject": draft["subject"],
+            "greeting": draft.get("greeting") or contacts_mod.greeting(c)[0], "subject": draft["subject"],
             "email_now": draft["body"], "master_email": draft["standard"],
-            "contact": {k: c.get(k, "") for k in ("first", "last", "title", "company", "role", "type", "language",
-                                                  "form", "relationship", "sector", "notes", "last_sent",
-                                                  "last_outcome", "last_summary")},
+            "contact": contact_for_claude(c),
+            "mail_history": list(history),
+            "mail_history_note": "Emails between the sender and %s in the last 12 months, newest first, read from "
+                                 "Outlook. Use them only when the reviewer's note refers to an earlier email or "
+                                 "conversation." % (draft.get("to") or c.get("email", "")),
             "write": "The whole email as it should read after the change: {contact_id, body} and, only if "
                      "the note asks for it, subject. Read references/01-rewriting.md first.",
         })
 
+    # ---- Claude adjusts the round to the list ------------------------------------
+
+    def _queue_personalize(self, rnd, drafts):
+        """Hand Claude the new emails, so each one fits its person: the greeting
+        from the name (Herr or Frau, the title), and anything the row asks for."""
+        self.add_job("personalize", {
+            "round_id": rnd["id"], "kind": rnd["kind"], "count": len(drafts),
+            "sender": {"name": rnd["sender_name"], "email": rnd["sender"]},
+            "emails": [{"contact_id": d["contact_id"], "template": d["template"], "subject": d["subject"],
+                        "email_now": d["body"], "rule_greeting": contacts_mod.greeting(d["contact"])[0],
+                        "contact": contact_for_claude(d["contact"])} for d in drafts],
+            "write": "One object per email: {contact_id, greeting} and, only if the row gives a reason to change "
+                     "the text, body (the whole email). Read references/05-personalizing.md first.",
+        }, replace=True, key=rnd["id"])
+
+    def take_personalize(self, job, result):
+        rnd = self.find_round(job["payload"]["round_id"])
+        wanted = {e["contact_id"] for e in job["payload"]["emails"]}
+        by_id = {d["contact_id"]: d for d in rnd["drafts"]}
+        problems = []
+        for item in result.get("drafts") or []:
+            cid = item.get("contact_id")
+            draft = by_id.get(cid)
+            if cid not in wanted or draft is None:
+                problems.append("%r is not an email of this job" % (cid,))
+                continue
+            greeting = " ".join(str(item.get("greeting") or "").split())
+            if not greeting:
+                problems.append("%s: greeting is missing" % cid)
+                continue
+            if not greeting.endswith(","):
+                greeting += ","
+            wanted.discard(cid)
+            if draft["status"] != "preparing":
+                continue
+            master = rnd["templates"].get(draft["template"], {}).get("body", "")
+            draft["greeting"] = greeting
+            draft["standard"] = checks.assemble(master, draft["contact"], greeting)
+            body = str(item.get("body") or "").replace("\r\n", "\n").strip()
+            draft["body"] = body or draft["standard"]
+            draft["changed_by"] = "list" if draft["body"] != draft["standard"] else ""
+            draft["status"] = "pending"
+        job["payload"]["emails"] = [e for e in job["payload"]["emails"] if e["contact_id"] in wanted]
+        job["done"] = job["total"] - len(wanted)
+        if not wanted:
+            self.finish_job(job)
+        self.recheck(rnd)
+        store.save_round(self.folder, rnd)
+        if not wanted:
+            self._after_preparing(rnd)
+        failed = [{"contact_id": d["contact_id"], "failed_checks": [c["text"] for c in d["checks"] if c["level"] == "fail"]}
+                  for d in rnd["drafts"] if d["changed_by"] == "list" and d["level"] == "fail"]
+        return {"ok": not problems, "problems": problems, "still_to_do": sorted(wanted), "failed_checks": failed}
+
+    def skip_preparing(self, round_id):
+        """The reviewer does not want to wait for Claude: the emails stand with
+        the greeting the list gives."""
+        rnd = self.find_round(round_id)
+        for job in self.jobs:
+            if job["type"] == "personalize" and job["payload"].get("round_id") == round_id and \
+                    job["status"] in ("queued", "taken"):
+                self.finish_job(job, "the reviewer went ahead without it")
+        for d in rnd["drafts"]:
+            if d["status"] == "preparing":
+                d["status"] = "pending"
+        self.recheck(rnd)
+        store.save_round(self.folder, rnd)
+        self._after_preparing(rnd)
+
+    def _after_preparing(self, rnd):
+        """A scheduled round that sends without review goes once Claude is done."""
+        if rnd.get("auto_send") and not any(d["status"] == "preparing" for d in rnd["drafts"]):
+            rnd["auto_send"] = False
+            store.save_round(self.folder, rnd)
+            self._send_unreviewed(rnd)
+
+    # ---- Claude looks up what the list does not have --------------------------------
+
+    def _queue_research(self, rnd, drafts):
+        self.add_job("research", {
+            "round_id": rnd["id"], "count": len(drafts),
+            "contacts": [dict(contact_for_claude(d["contact"]), contact_id=d["contact_id"],
+                              missing=(d.get("research") or {}).get("needed", []), template=d["template"])
+                         for d in drafts],
+            "write": "One object per contact: {contact_id, email, first, last, title, gender, role, greeting, "
+                     "source, confidence, note}; empty strings for what you could not find. Read "
+                     "references/06-research.md first.",
+        }, replace=True, key=rnd["id"])
+
+    def take_research(self, job, result):
+        rnd = self.find_round(job["payload"]["round_id"])
+        wanted = {c["contact_id"] for c in job["payload"]["contacts"]}
+        by_id = {d["contact_id"]: d for d in rnd["drafts"]}
+        problems = []
+        for item in result.get("found") or []:
+            cid = item.get("contact_id")
+            draft = by_id.get(cid)
+            if cid not in wanted or draft is None:
+                problems.append("%r is not a contact of this job" % (cid,))
+                continue
+            email = str(item.get("email") or "").strip().lower()
+            if email and not EMAIL_OK(email):
+                problems.append("%s: %r is not an email address" % (cid, email))
+                continue
+            source = str(item.get("source") or "").strip()
+            if (email or item.get("last")) and not re.match(r"^https?://", source):
+                problems.append("%s: say where it was found (source, a web address)" % cid)
+                continue
+            wanted.discard(cid)
+            if draft["status"] not in ("research", "skipped") or (draft.get("research") or {}).get("status") != "waiting":
+                continue
+            # a contact skipped meanwhile keeps what was found, for when it is put back
+            found = {k: " ".join(str(item.get(k) or "").split())[:200]
+                     for k in ("first", "last", "title", "role", "greeting", "note", "confidence")}
+            found.update(email=email, source=source[:500], gender=item.get("gender") if item.get("gender") in ("m", "f") else "")
+            useful = email or (found["last"] and "person" in draft["research"].get("needed", []))
+            draft["research"] = dict(draft["research"], status="found" if useful else "nothing",
+                                     found=found, accepted=False)
+            if draft["status"] == "research":
+                draft["status"] = "pending"
+        job["payload"]["contacts"] = [c for c in job["payload"]["contacts"] if c["contact_id"] in wanted]
+        job["done"] = job["total"] - len(wanted)
+        if not wanted:
+            self.finish_job(job)
+        self.recheck(rnd)
+        store.save_round(self.folder, rnd)
+        return {"ok": not problems, "problems": problems, "still_to_do": sorted(wanted)}
+
+    def accept_research(self, round_id, contact_id):
+        """The reviewer takes what Claude found: the address and the person go
+        into this email (never into the list itself)."""
+        rnd = self.find_round(round_id)
+        draft = next((d for d in rnd["drafts"] if d["contact_id"] == contact_id), None)
+        research = (draft or {}).get("research") or {}
+        if not draft or research.get("status") != "found":
+            raise Problem("There is nothing found online to use for this email.")
+        found = research.get("found") or {}
+        to = found.get("email") or draft.get("to")
+        if to in store.load_suppression(self.folder):
+            raise Problem("This address asked not to be contacted.")
+        if any(d is not draft and d.get("to") == to for d in rnd["drafts"]):
+            raise Problem("Another email of this round already goes to this address.")
+        c = draft["contact"]
+        for field in ("first", "last", "title", "gender", "role"):
+            if found.get(field):
+                c[field] = found[field]
+        c["email"] = to
+        draft["to"] = to
+        unchanged = draft["body"] == draft["standard"]
+        master = rnd["templates"].get(draft["template"], {}).get("body", "")
+        draft["greeting"] = found.get("greeting") or contacts_mod.greeting(c)[0]
+        if not draft["greeting"].endswith(","):
+            draft["greeting"] += ","
+        draft["standard"] = checks.assemble(master, c, draft["greeting"])
+        if unchanged:
+            draft["body"] = draft["standard"]
+        else:
+            draft["body"] = draft["greeting"] + "\n" + draft["body"].split("\n", 1)[1] if "\n" in draft["body"] else draft["standard"]
+        draft["research"] = dict(research, accepted=True)
+        if draft["status"] == "approved":
+            draft["status"] = "pending"
+        self.recheck(rnd)
+        store.save_round(self.folder, rnd)
+
     def recheck(self, rnd):
         people = [d["contact"] for d in rnd["drafts"]]
         for d in rnd["drafts"]:
-            if d["status"] in ("waiting", "sent", "outbox"):
+            if d["status"] in ("waiting", "sent", "outbox", "preparing", "research"):
                 continue
+            for att in d.get("attachments") or []:
+                att["missing"] = not os.path.isfile(store.attachment_path(att))
             d["checks"] = checks.check(d, d["contact"], [c for c in people if c is not d["contact"]])
             d["level"] = checks.worst(d["checks"])
 
@@ -341,6 +645,9 @@ class App:
                                               '"the whole email"}]}' % cid]}
         draft.update(body=body, status="pending", error="",
                      changed_by="claude" if body != draft["standard"] else "")
+        # numbers from the earlier emails are not made up when the note referred to them
+        history = " ".join("%s %s" % (m.get("subject", ""), m.get("text", "")) for m in job["payload"].get("mail_history") or [])
+        draft["known_numbers"] = sorted(set(re.findall(r"\d{2,}", history)))[:200]
         if str(item.get("subject") or "").strip():
             draft["subject"] = str(item["subject"]).strip()
         self.finish_job(job)
@@ -360,10 +667,30 @@ class App:
             raise Problem("This email has already been sent.")
         if draft["status"] == "waiting":
             raise Problem("Claude is changing this email. It is back in a moment.")
+        if draft["status"] in ("preparing", "research") and change != {"status": "skipped"}:
+            raise Problem("Claude is still preparing this email. It is ready in a moment.")
         if "status" in change:
             if change["status"] not in ("pending", "approved", "skipped"):
                 raise Problem("Unknown status.")
+            if change["status"] == "pending" and draft["status"] == "skipped" and draft.get("research") and \
+                    draft["research"].get("status") == "waiting":
+                change = dict(change, status="research")
+            if change["status"] == "approved" and any(c["level"] == "fail" and c["id"] in ("research", "address")
+                                                      for c in draft.get("checks") or []):
+                raise Problem("Settle the address first: use what Claude found, enter one, or skip this person.")
             draft["status"] = change["status"]
+        if "to" in change and change["to"] != draft.get("to"):
+            to = str(change["to"] or "").strip().lower()
+            if not EMAIL_OK(to):
+                raise Problem("This is not an email address.")
+            if to in store.load_suppression(self.folder):
+                raise Problem("This address asked not to be contacted.")
+            draft["to"] = to
+            draft["contact"]["email"] = to
+            if draft.get("research"):
+                draft["research"] = dict(draft["research"], accepted=True, by_hand=True)
+            if draft["status"] == "approved":
+                draft["status"] = "pending"
         before = (draft["subject"], draft["body"])
         if change.get("reset"):
             draft.update(body=draft["standard"], changed_by="", note="",
@@ -402,7 +729,7 @@ class App:
             raise Problem("Say what should be different, so Claude knows what to change.")
         draft.update(status="waiting", note=note.strip())
         store.save_round(self.folder, rnd)
-        self._queue_rewrite(rnd, draft)
+        self._fetch_and_rewrite(rnd, draft)
 
     def close_round(self, round_id):
         rnd = self.find_round(round_id)
@@ -410,8 +737,8 @@ class App:
             raise Problem("Emails are being sent. Stop the sending first.")
         rnd["status"] = "closed"
         for job in self.jobs:
-            if job["type"] == "rewrite" and job["payload"].get("round_id") == round_id and \
-                    job["status"] in ("queued", "taken"):
+            if job["type"] in ("rewrite", "personalize", "research") and \
+                    job["payload"].get("round_id") == round_id and job["status"] in ("queued", "taken"):
                 self.finish_job(job, "the round was closed")
         store.save_round(self.folder, rnd)
 
@@ -430,9 +757,9 @@ class App:
                 if d["contact_id"] not in ids:
                     continue
                 if test:
-                    if d["status"] not in ("waiting", "sending") and d["body"].strip():
+                    if d["status"] not in ("waiting", "sending", "preparing", "research") and d["body"].strip():
                         queue.append(d)
-                elif d["status"] == "approved" and d["to"] not in suppression:
+                elif d["status"] == "approved" and EMAIL_OK(d["to"]) and d["to"] not in suppression:
                     queue.append(d)
             if not queue:
                 raise Problem("Nothing to send: no approved email is among the ones chosen.")
@@ -467,9 +794,13 @@ class App:
             with self.lock:
                 self.sending["current"] = name.strip()
             to = self.me() if test else draft["to"]
-            subject = ("[Test, would go to %s] " % draft["to"] if test else "") + draft["subject"]
+            subject = ("[Test, would go to %s] " % (draft["to"] or "?") if test else "") + draft["subject"]
+            paths = [store.attachment_path(a) for a in draft.get("attachments") or []]
             try:
-                result = outlook.send(to, subject, draft["body"])
+                gone = [os.path.basename(p) for p in paths if not os.path.isfile(p)]
+                if gone:
+                    raise RuntimeError("The attachment %s is no longer on this computer." % gone[0])
+                result = outlook.send(to, subject, draft["body"], paths)
                 in_a_row = 0
                 with self.lock:
                     if test:
@@ -519,6 +850,14 @@ class App:
             sent = [(r, d) for r in self.my_rounds() for d in r["drafts"] if d["status"] in ("sent", "outbox")]
             if not sent:
                 raise Problem("Nothing has been sent yet, so there are no answers to look for.")
+            # Only the first answer counts. Whoever has answered is not looked for again,
+            # and the rest of the conversation is left alone.
+            self._requeue_unread(sent)
+            sent = [(r, d) for r, d in sent if not answered(d)]
+            if not sent:
+                self.checking = {"active": False, "last": store.stamp(),
+                                 "message": "Everyone written to has answered; there is nothing more to look for."}
+                return
             self.checking = {"active": True, "message": "Reading the inbox…", "last": self.checking["last"]}
         threading.Thread(target=self._check_loop, args=(sent,), daemon=True).start()
 
@@ -532,11 +871,7 @@ class App:
                 for rnd in {id(r): r for r, _ in sent}.values():
                     store.save_round(self.folder, rnd)
                 if to_classify:
-                    self.add_job("classify", {
-                        "count": len(to_classify), "answers": to_classify, "outcomes": OUTCOMES,
-                        "language": self.settings.get("language", "en"),
-                        "write": "One object per answer: {round_id, contact_id, outcome, summary, quote, "
-                                 "next_step}. Read references/02-replies.md first."})
+                    self._queue_classify(to_classify)
                 message = "%d new answer%s found." % (len(to_classify), "" if len(to_classify) == 1 else "s")
                 self.checking = {"active": False, "message": message, "last": store.stamp()}
         except Exception as exc:
@@ -544,8 +879,38 @@ class App:
                 self.checking = {"active": False, "message": "The inbox could not be read: %s" % str(exc)[:200],
                                  "last": self.checking["last"]}
 
+    def _requeue_unread(self, sent):
+        """A first answer that was found but never read by Claude (the app was
+        closed in between) is handed to Claude again."""
+        open_keys = {(a["round_id"], a["contact_id"]) for j in self.jobs if j["type"] == "classify"
+                     and j["status"] in ("queued", "taken") for a in j["payload"]["answers"]}
+        again = []
+        for rnd, d in sent:
+            pending = d.get("pending_reply")
+            if pending and not d.get("reply") and (rnd["id"], d["contact_id"]) not in open_keys:
+                again.append(self._answer_entry(rnd, d, pending.get("matched_by", "thread"),
+                                                [{"received": pending["received"], "subject": pending.get("subject", ""),
+                                                  "text": pending["text"]}]))
+        if again:
+            self._queue_classify(again)
+
+    def _answer_entry(self, rnd, d, matched_by, messages):
+        return {"round_id": rnd["id"], "contact_id": d["contact_id"],
+                "name": ("%s %s" % (d["contact"].get("first", ""), d["contact"].get("last", ""))).strip(),
+                "company": d["contact"].get("company", ""), "our_subject": d["subject"],
+                "our_email": d["body"], "matched_by": matched_by, "messages": messages}
+
+    def _queue_classify(self, answers):
+        self.add_job("classify", {
+            "count": len(answers), "answers": answers, "outcomes": OUTCOMES,
+            "language": self.settings.get("language", "en"),
+            "write": "One object per answer: {round_id, contact_id, outcome, summary, quote, "
+                     "next_step}. Read references/02-replies.md first."})
+
     def _file_answers(self, sent, found):
-        """Attach each message to the email it answers; return what Claude should read."""
+        """Attach each message to the email it answers; return what Claude should
+        read. Only a person's first answer is taken: an absence note does not
+        count as one, a bounce does."""
         fresh = {}
         for m in sorted(found, key=lambda x: x["received"]):
             target = None
@@ -562,6 +927,8 @@ class App:
             if key in d.setdefault("seen", []):
                 continue
             d["seen"].append(key)
+            if answered(d):
+                continue
             reply = d.get("reply") or {}
             if m["kind"] == "bounce":
                 d["reply"] = {"outcome": "bounce", "summary": "The email could not be delivered.",
@@ -572,13 +939,10 @@ class App:
                     d["reply"] = {"outcome": "out_of_office", "summary": "Automatic reply.", "quote": "",
                                   "next_step": "", "received": m["received"], "text": m["text"]}
             else:
-                entry = fresh.setdefault((rnd["id"], d["contact_id"]), {
-                    "round_id": rnd["id"], "contact_id": d["contact_id"],
-                    "name": ("%s %s" % (d["contact"].get("first", ""), d["contact"].get("last", ""))).strip(),
-                    "company": d["contact"].get("company", ""), "our_subject": d["subject"],
-                    "our_email": d["body"], "matched_by": m["matched_by"], "messages": []})
-                entry["messages"].append({"received": m["received"], "subject": m["subject"], "text": m["text"]})
-                d["pending_reply"] = {"received": m["received"], "text": m["text"]}
+                fresh[(rnd["id"], d["contact_id"])] = self._answer_entry(
+                    rnd, d, m["matched_by"], [{"received": m["received"], "subject": m["subject"], "text": m["text"]}])
+                d["pending_reply"] = {"received": m["received"], "text": m["text"], "subject": m["subject"],
+                                      "matched_by": m["matched_by"]}
         return list(fresh.values())
 
     def take_classification(self, job, result):
@@ -632,12 +996,161 @@ class App:
             raise Problem("Unknown outcome.")
         store.save_round(self.folder, rnd)
 
+    # ---- the two German versions of a master email -------------------------------------
+
+    def sync_template(self, key):
+        """The reviewer finished writing one German version: Claude writes the
+        other from it, Sie into du or du into Sie."""
+        target = COUNTERPART.get(key)
+        if not target:
+            raise Problem("Only the German versions are kept in step.")
+        if not self.settings.get("sync_forms", True):
+            return None
+        source = self.settings["templates"].get(key) or {}
+        if not source.get("body", "").strip():
+            return None
+        current = self.settings["templates"].get(target) or {}
+        h = text_hash(source.get("subject"), source.get("body"))
+        done = (self.settings.get("template_sync") or {}).get(target) or {}
+        if done.get("from") == key and done.get("hash") == h:
+            return None                      # already written from exactly this text
+        return self.add_job("convert", {
+            "count": 1, "source_key": key, "target_key": target,
+            "source_form": "du" if key.endswith("de_du") else "Sie",
+            "target_form": "du" if target.endswith("de_du") else "Sie",
+            "kind": "followup" if key.startswith("fu_") else "first",
+            "subject": source.get("subject", ""), "body": source.get("body", ""),
+            "target_now": {"subject": current.get("subject", ""), "body": current.get("body", "")},
+            "source_hash": h,
+            "write": "The other German version: {subject, body}. Read references/07-sie-du.md first.",
+        }, replace=True, key=target)
+
+    def take_convert(self, job, result):
+        p = job["payload"]
+        body = str(result.get("body") or "").replace("\r\n", "\n").strip()
+        subject = " ".join(str(result.get("subject") or "").split()) or p["subject"]
+        if not body:
+            return {"ok": False, "problems": ['Hand back {"subject": "...", "body": "the whole master email"}']}
+        source = self.settings["templates"].get(p["source_key"]) or {}
+        self.finish_job(job)
+        if text_hash(source.get("subject"), source.get("body")) != p["source_hash"]:
+            return {"ok": True, "note": "The text was changed again meanwhile, so this version was not used. A newer "
+                                        "job follows."}
+        sync = dict(self.settings.get("template_sync") or {})
+        sync[p["target_key"]] = {"from": p["source_key"], "hash": p["source_hash"],
+                                 "target_hash": text_hash(subject, body), "at": store.stamp()}
+        self.settings = store.save_settings({"templates": {p["target_key"]: {"subject": subject, "body": body}},
+                                             "template_sync": sync})
+        issues = checks.template_problems(self.settings["templates"]).get(p["target_key"], [])
+        return {"ok": True, "problems": [], "template_problems": issues}
+
+    def template_sync_state(self):
+        """For each German version: was it written by Claude from the other,
+        and does it still match?"""
+        out = {}
+        sync = self.settings.get("template_sync") or {}
+        templates = self.settings["templates"]
+        for target, source in COUNTERPART.items():
+            working = next((j for j in self.jobs if j["type"] == "convert" and j.get("key") == target
+                            and j["status"] in ("queued", "taken")), None)
+            failed = next((j for j in reversed(self.jobs) if j["type"] == "convert" and j.get("key") == target
+                           and j["status"] == "failed"), None)
+            done = sync.get(target) or {}
+            src, tgt = templates.get(source) or {}, templates.get(target) or {}
+            state = ""
+            if working:
+                state = "working"
+            elif done.get("from") == source:
+                if text_hash(tgt.get("subject"), tgt.get("body")) != done.get("target_hash"):
+                    state = "edited"
+                elif text_hash(src.get("subject"), src.get("body")) != done.get("hash"):
+                    state = "stale"
+                else:
+                    state = "fresh"
+            if failed and state in ("", "stale") and failed["created"] >= done.get("at", ""):
+                state = "failed"
+            out[target] = {"state": state, "from": source, "at": done.get("at", ""),
+                           "error": failed["error"] if failed and state == "failed" else ""}
+        return out
+
+    # ---- attachments --------------------------------------------------------------
+
+    def _decode_files(self, files):
+        out = []
+        for f in files or []:
+            try:
+                data = base64.b64decode(str(f.get("data") or ""), validate=False)
+            except (ValueError, TypeError):
+                raise Problem("The file could not be read.")
+            if not data:
+                raise Problem("The file %s is empty." % store.safe_name(f.get("name")))
+            if len(data) > store.ATTACHMENT_MAX_BYTES:
+                raise Problem("The file %s is larger than 20 MB, too large to send by email." % store.safe_name(f.get("name")))
+            out.append(store.add_attachment(f.get("name"), data))
+        return out
+
+    def add_attachments(self, body):
+        added = self._decode_files(body.get("files"))
+        if body.get("target") == "draft":
+            rnd = self.find_round(body["round_id"])
+            draft = self._open_draft(rnd, body["contact_id"])
+            have = {a["id"] for a in draft.setdefault("attachments", [])}
+            draft["attachments"] += [a for a in added if a["id"] not in have]
+            if draft["status"] == "approved":
+                draft["status"] = "pending"            # a change after approval is looked at again
+            self.recheck(rnd)
+            store.save_round(self.folder, rnd)
+        else:
+            kind = "followup" if body.get("kind") == "followup" else "round"
+            all_ = dict(self.settings.get("attachments") or {"round": [], "followup": []})
+            have = {a["id"] for a in all_.get(kind, [])}
+            all_[kind] = list(all_.get(kind, [])) + [a for a in added if a["id"] not in have]
+            self.settings = store.save_settings({"attachments": all_})
+        return added
+
+    def remove_attachment(self, body):
+        att_id = body.get("id")
+        if body.get("target") == "draft":
+            rnd = self.find_round(body["round_id"])
+            draft = self._open_draft(rnd, body["contact_id"])
+            draft["attachments"] = [a for a in draft.get("attachments") or [] if a["id"] != att_id]
+            if draft["status"] == "approved":
+                draft["status"] = "pending"
+            self.recheck(rnd)
+            store.save_round(self.folder, rnd)
+        else:
+            kind = "followup" if body.get("kind") == "followup" else "round"
+            all_ = dict(self.settings.get("attachments") or {"round": [], "followup": []})
+            all_[kind] = [a for a in all_.get(kind, []) if a["id"] != att_id]
+            self.settings = store.save_settings({"attachments": all_})
+
+    def _open_draft(self, rnd, contact_id):
+        draft = next((d for d in rnd["drafts"] if d["contact_id"] == contact_id), None)
+        if draft is None:
+            raise Problem("That draft no longer exists.")
+        if draft["status"] in ("sent", "outbox", "sending"):
+            raise Problem("This email has already been sent.")
+        return draft
+
     # ---- settings and schedule ------------------------------------------------
 
     def save(self, patch):
         with self.lock:
             before = dict(self.settings.get("schedule", {}))
-            allowed = {k: v for k, v in patch.items() if k in store.DEFAULT_SETTINGS}
+            allowed = {k: v for k, v in patch.items() if k in store.DEFAULT_SETTINGS
+                       and k not in ("attachments", "template_sync")}
+            if "theme" in allowed and allowed["theme"] not in ("light", "dark", "system"):
+                del allowed["theme"]
+            if "owner_code" in allowed:
+                allowed["owner_code"] = re.sub(r"[^A-ZÄÖÜ]", "", str(allowed["owner_code"] or "").upper())[:3]
+            for flag in ("personalize", "sync_forms") + (("unassigned_mine",) if allowed.get("unassigned_mine")
+                                                          is not None else ()):
+                if flag in allowed:
+                    allowed[flag] = allowed[flag] is True
+            if "filters" in allowed:
+                given = allowed["filters"] if isinstance(allowed["filters"], dict) else {}
+                allowed["filters"] = {k: [str(x)[:60] for x in given[k]][:60] for k in store.DEFAULT_SETTINGS["filters"]
+                                      if isinstance(given.get(k), list)}
             if "templates" in allowed:
                 allowed["templates"] = {k: v for k, v in allowed["templates"].items() if k in TEMPLATE_KEYS}
             if "schedule" in allowed:
@@ -704,18 +1217,32 @@ class App:
             if not self.settings["schedule"].get("auto_send"):
                 self.notice = "Scheduled round: %d emails are ready for your review." % total
                 return {"started": True, "count": total, "round_id": rnd["id"], "sending": 0, "held": 0}
-            # The user switched reviews off for scheduled rounds. What failed a check
-            # is still held back: that is a mistake a recipient would see.
-            held = self.approve_all(rnd["id"])
-            going = [d["contact_id"] for d in rnd["drafts"] if d["status"] == "approved"]
-            if not going:
-                self.notice = ("Scheduled round: nothing was sent without review, because every email failed "
-                               "a check. They are on the Review tab.")
-                return {"started": True, "count": total, "round_id": rnd["id"], "sending": 0, "held": held}
-            self.send(rnd["id"], set(going), False, True)
-            self.notice = ("Scheduled round: %d emails are being sent without review, as set on the Setup tab."
-                           % len(going)) + (" %d were held back because a check failed." % held if held else "")
-            return {"started": True, "count": total, "round_id": rnd["id"], "sending": len(going), "held": held}
+            if any(d["status"] == "preparing" for d in rnd["drafts"]):
+                # sent once Claude has adjusted them to the list: see _after_preparing
+                rnd["auto_send"] = True
+                store.save_round(self.folder, rnd)
+                self.notice = ("Scheduled round: %d emails are being adjusted to the list by Claude. They are sent "
+                               "without review as soon as that is done, as set on the Setup tab." % total)
+                return {"started": True, "count": total, "round_id": rnd["id"], "sending": 0, "held": 0,
+                        "preparing": True}
+            going, held = self._send_unreviewed(rnd)
+            return {"started": True, "count": total, "round_id": rnd["id"], "sending": going, "held": held}
+
+    def _send_unreviewed(self, rnd):
+        """The user switched reviews off for scheduled rounds. What failed a check
+        is still held back: that is a mistake a recipient would see. So is an
+        address found online, which nobody has confirmed."""
+        held = self.approve_all(rnd["id"])
+        going = [d["contact_id"] for d in rnd["drafts"] if d["status"] == "approved"]
+        held += len([d for d in rnd["drafts"] if d["status"] == "research"])
+        if not going:
+            self.notice = ("Scheduled round: nothing was sent without review, because every email failed "
+                           "a check. They are on the Review tab.")
+            return 0, held
+        self.send(rnd["id"], set(going), False, True)
+        self.notice = ("Scheduled round: %d emails are being sent without review, as set on the Setup tab."
+                       % len(going)) + (" %d were held back because a check failed." % held if held else "")
+        return len(going), held
 
     # ---- what the screen shows --------------------------------------------------
 
@@ -735,10 +1262,13 @@ class App:
         for c in s["contacts"]:
             c["reason"] = say(c["reason"])
             c["assumed"] = [say(a) for a in c.get("assumed", [])]
+        for v in s["template_sync"].values():
+            v["error"] = say(v["error"])
         if s["round"]:
             s["round"]["label"] = say(s["round"]["label"])
             for d in s["round"]["drafts"]:
                 d["error"] = say(d.get("error", ""))
+                d["contact"]["assumed"] = [say(a) for a in d["contact"].get("assumed", [])]
                 for check in d["checks"]:
                     check["text"] = say(check["text"])
         s["sending"]["message"] = say(s["sending"]["message"])
@@ -765,13 +1295,22 @@ class App:
                 "identity": self.identity,
                 "settings": self.settings,
                 "template_problems": checks.template_problems(self.settings["templates"]),
+                "template_sync": self.template_sync_state(),
                 "schedule": dict(plan, labels=schedule.LABELS),
                 "workbook": {"path": self.settings.get("workbook", ""), "ok": bool(book.get("ok")),
                              "problem": book.get("problem", ""), "sheet": book.get("sheet", ""),
+                             "sheets": book.get("sheets", []),
                              "missing_columns": book.get("missing_columns", []),
+                             "worked_out": book.get("worked_out", []),
                              "unmatched_headers": book.get("unmatched_headers", []),
+                             "owners": book.get("owners", {}),
+                             "uses_codes": contacts_mod.uses_codes(book.get("contacts") or []),
+                             "unassigned_mine": contacts_mod.unassigned_is_mine(book.get("contacts") or [],
+                                                                                 self.settings),
                              "data_folder": self.folder or ""},
-                "contacts": rows,
+                "team": contacts_mod.directory().get("team", []),
+                "filter_options": self._filter_options(book.get("contacts") or []),
+                "contacts": [{k: c.get(k) for k in SCREEN_FIELDS} for c in rows],
                 "round": current,
                 "sending": self.sending,
                 "checking": self.checking,
@@ -783,6 +1322,24 @@ class App:
                 "outcomes": OUTCOMES,
                 "suppression": store.load_suppression(self.folder),
             }
+
+    def _filter_options(self, people):
+        """What the list holds, for the filters on the Contacts tab, with counts."""
+        count = lambda key: sorted(
+            ({"value": v, "n": n} for v, n in _tally(c.get(key) or "none" for c in people).items()),
+            key=lambda x: (-x["n"], x["value"]))
+        states = {}
+        for c in people:
+            if c.get("state"):
+                states.setdefault(c["country"], {}).setdefault(c["state"], 0)
+                states[c["country"]][c["state"]] += 1
+        in_order = lambda items, order: sorted(items, key=lambda x: order.index(x["value"]) if x["value"] in order else 99)
+        return {"countries": count("country"),
+                "priorities": in_order(count("priority"), ["A", "B", "C", "D", "E", "F", "N", "none"]),
+                "relevance": in_order(count("relevance"), ["high", "medium", "low", "none"]),
+                "types": count("type"),
+                "states": {k: sorted(({"value": s, "n": n} for s, n in v.items()), key=lambda x: (-x["n"], x["value"]))
+                           for k, v in states.items()}}
 
     def _round_summary(self, rnd):
         after = self.followup_days()
@@ -962,6 +1519,21 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/draft/redraft":
                 with app.lock:
                     app.redraft(body["round_id"], body["contact_id"], str(body.get("note") or "")[:500])
+            elif path == "/api/draft/accept-research":
+                with app.lock:
+                    app.accept_research(body["round_id"], body["contact_id"])
+            elif path == "/api/round/skip-prepare":
+                with app.lock:
+                    app.skip_preparing(body["round_id"])
+            elif path == "/api/template/sync":
+                with app.lock:
+                    app.sync_template(str(body.get("key") or ""))
+            elif path == "/api/attachments/add":
+                with app.lock:
+                    return self._send(200, {"ok": True, "added": app.add_attachments(body)})
+            elif path == "/api/attachments/remove":
+                with app.lock:
+                    app.remove_attachment(body)
             elif path == "/api/send":
                 app.send(body["round_id"], set(body.get("ids") or []), bool(body.get("test")),
                          body.get("confirm") is True)
@@ -989,12 +1561,13 @@ class Handler(BaseHTTPRequestHandler):
                 with app.lock:
                     job = app.job(job_id)
                     if action == "fail":
-                        app.finish_job(job, str(body.get("reason") or "Claude could not do this.")[:300])
+                        app.give_up(job, str(body.get("reason") or "Claude could not do this.")[:300])
                         return self._send(200, {"ok": True})
                     if job["status"] in ("done", "failed"):
                         return self._send(200, {"ok": True, "note": "This job is already closed."})
                     taker = {"rewrite": app.take_rewrite, "classify": app.take_classification,
-                             "schedule": app.take_schedule}[job["type"]]
+                             "schedule": app.take_schedule, "personalize": app.take_personalize,
+                             "research": app.take_research, "convert": app.take_convert}[job["type"]]
                     return self._send(200, taker(job, body))
             else:
                 return self._send(404, {"error": "Not found."})

@@ -23,6 +23,14 @@ BY_VARIABLE = [
     "Law firm", "Tax / audit", "M&A adviser", "Consultant", "Bank", "Private equity", "Venture capital", "Other",
     "In this round", "Left out", "All", "To review", "Changed", "Approved",
     "Type", "Role", "Relationship", "Sector focus", "Notes", "Last written",
+    "Responsible", "Region", "Priority", "Relevance", "To do", "Comments", "Also named",
+    "Details missing", "Found online",
+    "Austria", "Germany", "Switzerland", "Liechtenstein", "Luxembourg", "United Kingdom", "United States",
+    "Czech Republic", "Poland", "Italy", "Romania", "Hungary", "Slovakia", "Slovenia", "Croatia", "Netherlands",
+    "France", "Spain", "Sweden", "Denmark", "Belgium", "Several countries", "Not known",
+    "High", "Medium", "Low", "Not set",
+    "Sure: named on the firm’s own website", "Fairly sure", "Not sure: please check",
+    "Email", "Name", "Herr/Frau", "Language", "Sie/du",
 ]
 STRING = r'"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\''
 CALL = re.compile(r'\bt[fn]?\(\s*(?:[\w.]+\s*,\s*)?(?:%s)(?:\s*,\s*(?:%s))?' % (STRING, STRING))

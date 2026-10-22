@@ -1,9 +1,11 @@
 """Put an email together, and check it before a person sees it.
 
 An email is the sender's own master text with the greeting on top. The
-greeting is worked out by rule from the contact's row (contacts.greeting);
-nothing else differs from one contact to the next unless the reviewer changes
-an email by hand or asks Claude to change it.
+greeting is worked out by rule from the contact's row (contacts.greeting), and
+Claude refines it when it adjusts the round to the list (a first name usually
+says Herr or Frau). Nothing else differs from one contact to the next unless
+the list gives Claude a reason, or the reviewer changes an email by hand or
+asks Claude to change it.
 
 The checks below are what stands between a mistake and the review screen. Each
 one is something a recipient would notice. Checks about wording only look at
@@ -28,6 +30,9 @@ MACHINE_PHRASES = [
     "in der heutigen", "schnelllebig", "maßgeschneidert", "nahtlos", "synergie", "geschätzt",
     "es wäre mir eine freude", "zögern sie nicht", "do not hesitate", "don't hesitate",
 ]
+# Words that promise an attachment.
+ATTACHMENT_WORDS = re.compile(r"\b(anbei|im anhang|in der anlage|beigefügt|beiliegend|attached|attachment|enclosed)\b",
+                              re.IGNORECASE)
 DE_WORDS = set("der die das und ich wir sie ist nicht mit für auf dass ein eine den dem wie bei uns auch "
                "noch nach zu im haben hat war sind ihre ihren ihnen dir dein euch über wieder seit".split())
 EN_WORDS = set("the and you your our are was were with for that this have has not from would about been "
@@ -80,11 +85,11 @@ def template_problems(templates):
     return out
 
 
-def assemble(template_body, contact):
+def assemble(template_body, contact, greeting=None):
     """The email for one contact: their greeting, then the master text."""
     text = "\n".join(line.rstrip() for line in (template_body or "").replace("\r\n", "\n").split("\n"))
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return contacts_mod.greeting(contact)[0] + "\n\n" + text
+    return (greeting or contacts_mod.greeting(contact)[0]) + "\n\n" + text
 
 
 def changed_lines(body, standard):
@@ -110,9 +115,13 @@ def _language_of(text):
 
 
 def _profile_text(contact):
-    return " ".join(str(contact.get(k, "")) for k in
-                    ("first", "last", "title", "company", "role", "relationship", "sector", "notes",
-                     "last_sent", "last_summary"))
+    """Everything the list says about this person, as one text."""
+    parts = [str(contact.get(k, "")) for k in
+             ("first", "last", "title", "company", "role", "relationship", "sector", "notes", "todos", "city",
+              "region", "department", "first_contact_date", "last_sent", "last_summary")]
+    parts += [str(v) for v in (contact.get("extra") or {}).values()]
+    parts += [str(v) for v in contact.get("comments") or []]
+    return " ".join(parts)
 
 
 def check(draft, contact, others):
@@ -125,6 +134,16 @@ def check(draft, contact, others):
     body, standard = draft.get("body", ""), draft.get("standard", "")
     lang, form = contact.get("language"), contact.get("form")
 
+    research = draft.get("research") or {}
+    if research.get("status") == "found" and not research.get("accepted"):
+        add("research", "fail", "Claude found these details online. Check them and press “Use these details” "
+                                "before this email can be approved.")
+    elif research.get("status") == "nothing" and not draft.get("to"):
+        add("research", "fail", "Claude found no reliable address online. Add one by hand or skip this person.")
+    elif "to" in draft and not draft.get("to"):
+        add("address", "fail", "There is no email address for this person yet.")
+    elif draft.get("to") and not contacts_mod.EMAIL_RE.match(draft["to"]):
+        add("address", "fail", "The email address looks wrong.")
     if not draft.get("subject", "").strip():
         add("subject", "fail", "No subject line.")
     if not body.strip():
@@ -134,8 +153,10 @@ def check(draft, contact, others):
     if left:
         add("placeholder", "fail", "A placeholder was left in the text: %s" % left.group(0))
 
-    # the greeting is the rule's, and names the right person
+    # the greeting is the one settled for this person, and names the right person
     want, warning = contacts_mod.greeting(contact)
+    if draft.get("greeting"):
+        want, warning = draft["greeting"], ""
     first_line = body.strip().split("\n", 1)[0].strip()
     if first_line != want:
         name = contact.get("first") if (form == "du" and contact.get("first")) else contact.get("last")
@@ -143,8 +164,18 @@ def check(draft, contact, others):
             add("greeting", "fail", "The greeting does not name %s. Expected: %s" % (name, want))
         else:
             add("greeting", "warn", "The greeting was changed. The list gives: %s" % want)
+    elif draft.get("greeting"):
+        name = contact.get("first") if form == "du" else contact.get("last")
+        if name and name.lower() not in want.lower():
+            add("greeting", "fail", "The greeting does not name %s." % name)
     if warning:
         add("greeting-data", "warn", "%s in the list, so the greeting is a neutral one." % warning.capitalize())
+
+    if ATTACHMENT_WORDS.search(body) and not draft.get("attachments"):
+        add("attachment", "warn", "The text mentions an attachment, but nothing is attached.")
+    for att in draft.get("attachments") or []:
+        if att.get("missing"):
+            add("attachment", "fail", "The attachment %s is no longer on this computer." % att.get("name", ""))
 
     # Sie and du do not mix
     if lang == "de":
@@ -174,8 +205,8 @@ def check(draft, contact, others):
             % ("German" if written_in == "de" else "English", "German" if lang == "de" else "English"))
 
     # nothing claimed that neither the list nor the reviewer's own note says
-    known = _profile_text(contact) + " " + str(draft.get("note", ""))
-    if draft.get("changed_by") == "claude":
+    known = " ".join([_profile_text(contact), str(draft.get("note", "")), " ".join(draft.get("known_numbers") or [])])
+    if draft.get("changed_by") in ("claude", "list"):
         for number in sorted(set(re.findall(r"\d{2,}", changed))):
             if number not in known:
                 add("unsupported", "warn", "Mentions \"%s\", which is neither in this contact's row nor in "

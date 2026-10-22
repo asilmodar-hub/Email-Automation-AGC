@@ -10,6 +10,7 @@ Writes  agc-deal-flow-outreach/assets/Contacts_Template.xlsx
 Every person and firm in the fixture is made up, and every address ends in
 .example, which cannot receive mail.
 """
+import datetime as dt
 import os
 import random
 
@@ -166,6 +167,77 @@ def fixture():
     return out
 
 
+# A list laid out like AGC's own Deal Origination Cockpit: a title row above the
+# header, the contacts on "Intermediäre" with one "Ansprechpartner" cell for the
+# person, short forms in "Zuständigkeit", planning columns, a cell comment, a
+# hidden sheet whose responsible person is an X under a row of short forms, and
+# sheets with figures but no addresses. Every name and firm is invented.
+COCKPIT_HEADER = ["Firma", "Kategorie", "Ansprechpartner", "Position", "E-Mail", "Adresse", "PLZ", "Ort", "Tel",
+                  "Co-Investor", "Region", "Zuständigkeit", "Relevanz für AT Deal Flow", "Rahmen-vereinbarung",
+                  "UP/Info gesendet", "Prio.", "Prio. Erinnerung", "01-02 2026 Plan", "01-02 2026 Ist", "01-02 2026 Plan",
+                  "Sonstige todos", "Fällig bis\n(Datum)", "Anmerkung (Person & Wann)", "Erstansprache Mail erfolgt? (0/1)",
+                  "Datum Erstansprache"]
+COCKPIT_ROWS = [
+    # Firma, Kategorie, Ansprechpartner, Position, E-Mail, PLZ, Ort, Region, Zuständigkeit, Relevanz, Prio, Anmerkung, Erstansprache
+    ("Lindengrund Partners", "M&A Advisor", "Michael Hagen", "Partner", "mh@lindengrund.example", 1010, "Wien", None, "VK", "Hoch", "B", "Kennt den Markt für Nachfolgen", None),
+    ("Kobaltblau Consulting", "Berater", "Georg Kranz", None, "kranz@kobaltblau.example", 8042, "Graz", None, "VK", "Mittel", "C", None, None),
+    ("Seeblick Capital", "PE Fonds Ausland", "Paulsen, Andreas Roth", None, "apaulsen@seeblick.example", "n.a.", "Wien", None, "VK", None, "D", None, None),
+    ("Weidenhof Advisory", "M&A Advisor", "Kleebach, Rosner", None, "roman.rosner@weidenhof.example", None, "München", "Bavaria", "VK", "Mittel", "C", None, None),
+    ("Nordlicht Corporate Finance", "M&A Advisor", "Hr. Zeller", "MD", "zeller@nordlicht.example", 60325, "Frankfurt", "Hessen", "VK", "Niedrig", "D", None, None),
+    ("Uferweg Rechtsanwälte", "Rechtsanwälte", "Mag. Sabine Dorn", None, "Sabine Dorn <dorn@uferweg.example>", None, "Linz", None, "VK", "Hoch", "A", None, None),
+    ("Talblick Holding", "Family Office / Industrieholding", None, None, "office@talblick.example", None, "Salzburg", None, "VK", "Mittel", "C", None, None),
+    ("Bergkamm Ventures", "VC Fonds Inland", "Petra Lindner", "Partnerin", None, None, "Wien", "Vienna", "VK", "Mittel", "C", None, None),
+    ("Morgenrot M&A", "M&A Advisor", None, None, None, None, "Zürich", "Switzerland", "VK", None, "E", None, None),
+    ("Thames Bridge Advisors", "M&A Advisor", "David Shore", "Co-Founder", "david@thamesbridge.example", None, "London", "United Kingdom", "VK", "Niedrig", "D", None, None),
+    ("Krähenfeld Steuerberatung", "Steuerberater", "Dr. Barbist, Johannes", None, "j.barbist@kraehenfeld.example", None, "Innsbruck", None, "VK", None, "D", None, "2026-09-30"),
+    ("Silberau Partners", "M&A Advisor", "Jan Pöschl", None, "j.poeschl@silberau.example", None, "Berlin", None, "KL", "Mittel", "C", None, None),
+    ("Eichenhain Beratung", "Sonstige Berater", "Daniel Bezner", None, "daniel.bezner@eichenhain.example", None, "Wien", None, "Kl", "Mittel", "C", None, None),
+    ("Grünspan Capital", "PE Fonds Inland", "Lisa Kern", None, "lisa.kern@gruenspan.example", None, "Wien", None, None, "Hoch", "B", None, None),
+    ("Abendrot Finanz", "M&A Advisor", "Felix Hahn", None, "felix.hahn@abendrot.example; office@abendrot.example", None, "Stuttgart", None, "DJ", None, "D", None, None),
+]
+
+
+def cockpit(out=None):
+    wb = openpyxl.Workbook()
+    wb.active.title = "Dealfloworigination->"
+    rating = wb.create_sheet("Auswertung")
+    rating.append(["Auswertung Deal-Origination"])
+    rating.append(["Zuständigkeit", "Kontaktaufnahmen Plan", "Kontaktaufnahmen IST"])
+    rating.append(["VK", 12, 3])
+    ws = wb.create_sheet("Intermediäre")
+    ws.append(["Übersicht Intermediäre"] + [None] * 16 + ["Auswertung 2026"])
+    ws.append(COCKPIT_HEADER)
+    for firm, cat, person, role, email, plz, city, region, owner, rel, prio, note, first in COCKPIT_ROWS:
+        ws.append([firm, cat, person, role, email, None, plz, city, None, None, region, owner, rel, None,
+                   "ja" if prio == "B" else None, prio, prio, 1, 0, 0, None, None, note, 1 if first else None,
+                   dt.datetime.strptime(first, "%Y-%m-%d") if first else None])
+    from openpyxl.comments import Comment
+    ws["C4"].comment = Comment("Erika Beispiel:\nHat das Unternehmen gewechselt, neue Adresse folgt", "Erika Beispiel")
+    bank = wb.create_sheet("Raiffeisen")
+    bank.sheet_state = "hidden"
+    bank.append(["Übersicht Netzwerk/Ansprechpartner Raiffeisen"])
+    bank.append(["Person", "Bank", "Position", "Bereich", "Mailadresse", "Adresse", "PLZ", "Ort", "Tel", "Region",
+                 "Zuständig", None, None, None, None, "Ranking"])
+    bank.append([None] * 10 + ["KLA", "DJE", "CGA", "OBK", "VKO", None])
+    bank.append(["Sigrid Rainer", "Landesbank Beispiel", "Senior Manager", "Corporate Clients", "sigrid.rainer@lb-beispiel.example",
+                 None, None, None, None, "AT", None, None, None, None, "X", "High"])
+    bank.append(["Klaus Imberg", "Landesbank Beispiel", "MD", "Head of M&A", "klaus.imberg@lb-beispiel.example",
+                 None, None, None, None, "AT, Osteuropa", "X", None, None, None, None, "High"])
+    db = wb.create_sheet("Datenbanken")
+    db.sheet_state = "hidden"
+    db.append(["Datenbanken"])
+    db.append(["Firma", "Fokus", "Ansprechpartner", "Position", "Mailadresse"])
+    db.append(["Beispieldatenbank", "VC", None, None, None])
+    db.append(["[tbd]"])
+    helper = wb.create_sheet("Hilfstabelle")
+    helper.append(["Kategorie", "Zuständigkeit", None, "Relevanz AT Deal Flow"])
+    helper.append(["M&A Advisor", "KL", None, "Hoch"])
+    out = out or os.path.join(ROOT, "dev", "fixtures", "agc_cockpit_like.xlsx")
+    wb.save(out)
+    return out
+
+
 if __name__ == "__main__":
     print("wrote", template())
     print("wrote", fixture())
+    print("wrote", cockpit())

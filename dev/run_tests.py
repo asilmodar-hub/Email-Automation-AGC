@@ -4,6 +4,7 @@ whole run uses the stand-in mailbox and a throwaway settings folder.
 
     python dev/run_tests.py
 """
+import base64
 import datetime as dt
 import io
 import json
@@ -32,6 +33,7 @@ import server  # noqa: E402
 import store  # noqa: E402
 
 FIXTURE = os.path.join(ROOT, "dev", "fixtures", "contacts_50.xlsx")
+COCKPIT = os.path.join(ROOT, "dev", "fixtures", "agc_cockpit_like.xlsx")
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ME = "tester@agcapital.example"
 RESULTS = []
@@ -224,8 +226,10 @@ def a_changed_greeting_is_noticed():
 def the_master_emails_are_checked_too():
     problems = checks.template_problems(server._starter_templates())
     assert set(problems) == set(server.TEMPLATE_KEYS)
-    assert any("[[note to fill in]]" in p for p in problems["de_sie"])
-    assert problems["fu_en"] == [] and problems["fu_de_du"] == [], problems
+    assert all(p == [] for p in problems.values()), problems          # the starter emails have nothing to fill in
+    assert not any("[[" in t["body"] or "{" in t["body"] for t in server._starter_templates().values())
+    assert checks.template_problems({"de_sie": {"subject": "x", "body": "Wir suchen [[Branche]]."}})["de_sie"] == \
+        ["a [[note to fill in]] is still in the text"]
     mixed = {"de_sie": {"subject": "x", "body": "ich melde mich bei dir."},
              "de_du": {"subject": "x", "body": "ich melde mich bei Ihnen."},
              "en": {"subject": "", "body": "Hello {opening}"}}
@@ -312,8 +316,10 @@ def the_whole_flow():
         assert api.call("/api/state", token="wrong")[0] == 403
         api.until(lambda s: s["identity"].get("ok"))
 
-        # setup: list, finished master emails; every change is on disk at once
-        assert api.call("/api/settings", {"workbook": book, "templates": finished(app.settings["templates"])})[0] == 200
+        # setup: list, finished master emails; every change is on disk at once. Claude's pass
+        # over each email is switched off here: this test is about everything around it.
+        assert api.call("/api/settings", {"workbook": book, "templates": finished(app.settings["templates"]),
+                                          "personalize": False})[0] == 200
         assert store.load_settings()["workbook"] == book
         s = api.state()
         assert s["workbook"]["ok"] and len(s["contacts"]) == 53
@@ -677,7 +683,8 @@ def the_screen_speaks_german_when_asked():
         german = api.state()
         reasons = {c["reason"] for c in german["contacts"]}
         assert "vor 0 Tagen angeschrieben" not in reasons          # nobody has been written to yet
-        assert {"gehört zu Somebody Else", "keine E-Mail-Adresse", "in der Liste als „nicht kontaktieren“ markiert"} <= reasons, reasons
+        assert {"gehört zu Somebody Else", "keine E-Mail-Adresse: anhaken, damit Claude es heraussucht",
+                "in der Liste als „nicht kontaktieren“ markiert"} <= reasons, reasons
         assert german["schedule"]["labels"]["quarterly"] == "Jedes Quartal"
         flagged = [c["text"] for d in german["round"]["drafts"] for c in d["checks"]]
         assert flagged and all(t == "Herr/Frau fehlt in der Liste, daher ist die Anrede neutral." for t in flagged), flagged
@@ -694,6 +701,336 @@ def the_screen_speaks_german_when_asked():
     finally:
         api.call("/api/settings", {"language": "en"})
         httpd.shutdown()
+
+
+# ---- AGC's own list ------------------------------------------------------------
+
+@test
+def the_agc_list_is_read_with_all_its_rows_and_columns():
+    book = contacts.read_workbook(COCKPIT)
+    assert book["ok"], book["problem"]
+    # the contacts sheet and the hidden bank sheet; the sheets without addresses are left alone
+    assert book["sheets"] == ["Intermediäre", "Raiffeisen"], book["sheets"]
+    assert len(book["contacts"]) == 17, len(book["contacts"])
+    assert book["missing_columns"] == [] and set(book["worked_out"]) == {"gender", "language", "form"}
+    by = {(c["company"], c["last"]): c for c in book["contacts"]}
+    hagen = by[("Lindengrund Partners", "Hagen")]
+    assert (hagen["first"], hagen["email"], hagen["owner"], hagen["city"], hagen["country"], hagen["state"]) == \
+        ("Michael", "mh@lindengrund.example", "VK", "Wien", "AT", "Wien")
+    assert (hagen["priority"], hagen["relevance"], hagen["type"], hagen["notes"]) == \
+        ("B", "high", "M&A adviser", "Kennt den Markt für Nachfolgen")
+    # every column without a field of its own travels with the contact
+    assert hagen["extra"]["UP/Info gesendet"] == "ja" and hagen["extra"]["Prio. Erinnerung"] == "B"
+    assert "01-02 2026 Plan" in hagen["extra"] and "01-02 2026 Plan (T)" in hagen["extra"]
+    # two people in one cell: the one the address belongs to is written to, the other is kept as a note
+    two = by[("Seeblick Capital", "Paulsen")]
+    assert two["first"] == "" and two["others"] == ["Andreas Roth"], two
+    rosner = by[("Weidenhof Advisory", "Rosner")]
+    assert rosner["first"] == "Roman" and "first name taken from the email address" in rosner["assumed"]
+    assert rosner["country"] == "DE" and rosner["state"] == "Bayern"
+    # "Hr." says Herr; "Dr. Barbist, Johannes" is one person written surname first
+    assert by[("Nordlicht Corporate Finance", "Zeller")]["gender"] == "m"
+    barbist = by[("Krähenfeld Steuerberatung", "Barbist")]
+    assert (barbist["title"], barbist["first"]) == ("Dr.", "Johannes")
+    assert contacts.greeting(barbist)[0] == "Guten Tag Dr. Johannes Barbist,"
+    # "Name <address>" and two addresses in one cell
+    assert by[("Uferweg Rechtsanwälte", "Dorn")]["email"] == "dorn@uferweg.example"
+    hahn = by[("Abendrot Finanz", "Hahn")]
+    assert hahn["email"] == "felix.hahn@abendrot.example" and hahn["extra"]["Further addresses"] == "office@abendrot.example"
+    # a cell comment, without Excel's notice and the author's name
+    assert by[("Kobaltblau Consulting", "Kranz")]["comments"] == ["Hat das Unternehmen gewechselt, neue Adresse folgt"]
+    # the date of the first contact, from the list
+    assert barbist["first_contact_date"] == "2026-09-30"
+    # English for a contact in London; "Kl" is KL
+    assert by[("Thames Bridge Advisors", "Shore")]["language"] == "en"
+    assert by[("Eichenhain Beratung", "Bezner")]["owner"] == "KL"
+    # an X under a row of short forms says who looks after a contact
+    assert by[("Landesbank Beispiel", "Rainer")]["owner"] == "VKO"
+    # what is missing is a problem a look online can solve, not a dead end
+    assert by[("Talblick Holding", "")]["problems"] == ["no name"]
+    assert by[("Bergkamm Ventures", "Lindner")]["problems"] == ["no email address"]
+    assert book["owners"]["VK"] == 11
+
+
+@test
+def whose_contact_it_is_comes_from_the_short_form():
+    assert contacts.initials("Vsevolod Kornilov") == "VK" and contacts.initials("Kornilov, Vsevolod") == "VK"
+    assert contacts.code_for("Vsevolod Kornilov", "vk@agcapital.example") == "VK"
+    assert contacts.code_for("", "max.mustermann@agcapital.example") == "MM"
+    assert contacts.code_for("Max Mustermann", "mm@agcapital.example") == "MM"
+    mine = lambda owner, code="VK": contacts.is_mine({"owner": owner}, "", "", code, False)
+    assert mine("VK") and mine("VKO") and mine("KL, VK") and not mine("KL") and not mine("KLA")
+    assert not mine("") and contacts.is_mine({"owner": ""}, "", "", "VK", True)
+    book = contacts.read_workbook(COCKPIT)
+    assert contacts.uses_codes(book["contacts"]) and not contacts.uses_codes(contacts.read_workbook(FIXTURE)["contacts"])
+    settings = dict(store.DEFAULT_SETTINGS, owner_code="VK")
+    rows = {(c["company"], c["last"]): c for c in contacts.select(book["contacts"], settings, ME, {}, {})}
+    assert rows[("Lindengrund Partners", "Hagen")]["included"]
+    assert rows[("Silberau Partners", "Pöschl")]["reason"] == "belongs to KL"
+    assert rows[("Grünspan Capital", "Kern")]["reason"] == "nobody is responsible for this contact in the list"
+    assert rows[("Landesbank Beispiel", "Rainer")]["included"]
+    assert rows[("Krähenfeld Steuerberatung", "Barbist")]["reason"] == "first contacted %d days ago according to the list" \
+        % (dt.date.today() - dt.date(2026, 9, 30)).days
+    # missing details: left out, but a tick brings them in for Claude to look up
+    lindner = rows[("Bergkamm Ventures", "Lindner")]
+    assert not lindner["included"] and not lindner["locked"] and lindner["research"] == ["email"]
+    assert lindner["reason"] == "no email address: tick to have Claude look it up"
+    ticked = {c["id"]: c for c in contacts.select(book["contacts"], settings, ME, {}, {}, {lindner["id"]: True})}
+    assert ticked[lindner["id"]]["included"] and ticked[lindner["id"]]["reason"] == "Claude will look up the missing details"
+    assert rows[("Morgenrot M&A", "")]["research"] == ["email", "person"]
+    # a list of names (the template): an empty Owner cell is whoever runs the round
+    assert contacts.unassigned_is_mine(contacts.read_workbook(FIXTURE)["contacts"], store.DEFAULT_SETTINGS)
+
+
+@test
+def filters_decide_who_is_in_the_round():
+    book = contacts.read_workbook(COCKPIT)
+    base = dict(store.DEFAULT_SETTINGS, owner_code="VK")
+    inside = lambda **f: {c["company"] for c in contacts.select(
+        book["contacts"], dict(base, filters=dict(store.DEFAULT_SETTINGS["filters"], **f)), ME, {}, {}) if c["included"]}
+    everyone = inside()
+    assert {"Lindengrund Partners", "Nordlicht Corporate Finance", "Thames Bridge Advisors"} <= everyone
+    austria = inside(countries=["AT"])
+    assert "Lindengrund Partners" in austria and "Nordlicht Corporate Finance" not in austria and "Thames Bridge Advisors" not in austria
+    assert inside(countries=["AT"], states=["Wien"]) == {"Lindengrund Partners", "Seeblick Capital"}
+    assert inside(priorities=["A", "B"]) == {"Lindengrund Partners", "Uferweg Rechtsanwälte"}
+    assert inside(relevance=["high"]) == {"Lindengrund Partners", "Uferweg Rechtsanwälte"}
+    left = {c["company"]: c["reason"] for c in contacts.select(
+        book["contacts"], dict(base, filters=dict(store.DEFAULT_SETTINGS["filters"], countries=["DE"])), ME, {}, {})}
+    assert left["Lindengrund Partners"] == "outside your region filter"
+
+
+def _as_claude(api, kind, seconds=5):
+    job = api.call("/api/jobs/next?wait=%d" % seconds)[1]["job"]
+    assert job and job["type"] == kind, job
+    return job
+
+
+@test
+def claude_prepares_looks_up_and_keeps_sie_and_du_in_step():
+    """AGC's own list, start to finish: Claude adjusts each email to the list,
+    looks up a missing address, files go out with the emails, the reviewer
+    refers to an earlier email, the du version is written from the Sie one,
+    and only the first answer is read."""
+    home_before = os.environ["AGC_OUTREACH_HOME"]
+    os.environ["AGC_OUTREACH_HOME"] = os.path.join(TMP, "home-agc")
+    book = os.path.join(TMP, "agc", "Deal_Origination_Cockpit.xlsx")
+    os.makedirs(os.path.dirname(book))
+    shutil.copy(COCKPIT, book)
+    httpd, app = server.make_server()
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    api = Client(httpd, app)
+    try:
+        api.until(lambda s: s["identity"].get("ok"))
+        api.call("/api/settings", {"workbook": book, "owner_code": "vk", "theme": "dark"})
+        s = api.state()
+        assert s["settings"]["owner_code"] == "VK" and s["settings"]["theme"] == "dark"
+        assert s["settings"]["personalize"] and s["settings"]["sync_forms"]
+        assert s["workbook"]["sheets"] == ["Intermediäre", "Raiffeisen"] and s["workbook"]["uses_codes"]
+        assert not s["workbook"]["unassigned_mine"]
+        assert "extra" not in s["contacts"][0]                       # the screen gets what it shows, not the whole row
+        assert {"value": "AT", "n": 9} in s["filter_options"]["countries"]
+
+        # Sie and du: writing one has Claude write the other
+        api.call("/api/settings", {"templates": {"de_sie": {"subject": "Kurze Frage", "body":
+                 "ich melde mich bei Ihnen, weil wir Unternehmen suchen.\n\nFalls Ihnen etwas begegnet, freue ich mich.\n\nBeste Grüße"}}})
+        api.call("/api/template/sync", {"key": "de_sie"})
+        api.call("/api/template/sync", {"key": "de_sie"})            # twice: still one job
+        assert api.state()["template_sync"]["de_du"]["state"] == "working"
+        conv = _as_claude(api, "convert")
+        assert conv["payload"]["source_form"] == "Sie" and conv["payload"]["target_form"] == "du"
+        assert len([j for j in api.state()["jobs"] if j["type"] == "convert"]) == 1
+        du_text = "ich melde mich bei dir, weil wir Unternehmen suchen.\n\nFalls dir etwas begegnet, freue ich mich.\n\nLiebe Grüße"
+        back = api.call("/api/jobs/%s/result" % conv["id"], {"subject": "Kurze Frage", "body": du_text})[1]
+        assert back["ok"] and back["template_problems"] == []
+        s = api.state()
+        assert s["settings"]["templates"]["de_du"]["body"] == du_text
+        assert s["template_sync"]["de_du"]["state"] == "fresh"
+        api.call("/api/template/sync", {"key": "de_sie"})            # nothing changed: no new job
+        assert not [j for j in api.state()["jobs"] if j["type"] == "convert"]
+        # a version changed while Claude was writing is not overwritten
+        api.call("/api/settings", {"templates": {"de_du": {"body": du_text + " "}}})
+        api.call("/api/template/sync", {"key": "de_du"})
+        late = _as_claude(api, "convert")
+        api.call("/api/settings", {"templates": {"de_du": {"body": du_text}}})
+        stale = api.call("/api/jobs/%s/result" % late["id"], {"subject": "x", "body": "something else"})[1]
+        assert stale["ok"] and "not used" in stale["note"]
+        assert "Ihnen" in store.load_settings()["templates"]["de_sie"]["body"]
+
+        # a file for every email of the round
+        pdf = base64.b64encode(b"%PDF-1.4 invented teaser").decode("ascii")
+        code, added = api.call("/api/attachments/add", {"target": "master", "kind": "round",
+                                                        "files": [{"name": "..\\\\AGC Teaser.pdf", "data": pdf}]})
+        assert code == 200 and added["added"][0]["name"] == "AGC Teaser.pdf", added
+        assert [a["name"] for a in api.state()["settings"]["attachments"]["round"]] == ["AGC Teaser.pdf"]
+
+        # tick a contact without an address, so Claude looks it up
+        lindner = next(c for c in api.state()["contacts"] if c["last"] == "Lindner")
+        assert not lindner["included"] and lindner["research"] == ["email"]
+        api.call("/api/override", {"contact_id": lindner["id"], "included": True})
+        assert api.call("/api/round/start", {})[0] == 200
+        s = api.state()
+        rnd = s["round"]
+        rid = rnd["id"]
+        by_last = {d["contact"]["last"]: d for d in rnd["drafts"]}
+        assert by_last["Lindner"]["status"] == "research" and by_last["Lindner"]["to"] == ""
+        assert all(d["status"] == "preparing" for d in rnd["drafts"] if d["contact"]["last"] != "Lindner")
+        assert all(d["attachments"][0]["name"] == "AGC Teaser.pdf" for d in rnd["drafts"])
+        assert api.call("/api/draft/update", {"round_id": rid, "contact_id": by_last["Hagen"]["contact_id"],
+                                              "change": {"status": "approved"}})[0] == 400      # not ready yet
+
+        # Claude adjusts the emails to the list: the greeting from the name, one line where the row says so
+        prep = _as_claude(api, "personalize")
+        emails = {e["contact"]["last"]: e for e in prep["payload"]["emails"]}
+        assert "Lindner" not in emails and emails["Hagen"]["rule_greeting"] == "Guten Tag Michael Hagen,"
+        assert emails["Hagen"]["contact"]["extra"]["UP/Info gesendet"] == "ja"
+        hagen = emails["Hagen"]
+        line = hagen["email_now"].replace("Guten Tag Michael Hagen,", "Sehr geehrter Herr Hagen,")
+        line = line.replace("Beste Grüße", "Sie kennen den Markt für Nachfolgen wie kaum jemand.\n\nBeste Grüße")
+        part = api.call("/api/jobs/%s/result" % prep["id"], {"drafts": [
+            {"contact_id": hagen["contact_id"], "greeting": "Sehr geehrter Herr Hagen", "body": line},
+            {"contact_id": "nobody@nowhere.example", "greeting": "Hallo,"}]})[1]
+        assert not part["ok"] and len(part["still_to_do"]) == len(emails) - 1
+        rest = [{"contact_id": e["contact_id"], "greeting": e["rule_greeting"]} for k, e in emails.items() if k != "Hagen"]
+        assert api.call("/api/jobs/%s/result" % prep["id"], {"drafts": rest})[1]["still_to_do"] == []
+        d = api.draft(hagen["contact_id"])
+        assert d["status"] == "pending" and d["greeting"] == "Sehr geehrter Herr Hagen," and d["changed_by"] == "list"
+        assert d["standard"].startswith("Sehr geehrter Herr Hagen,\n\n") and not [c for c in d["checks"] if c["level"] == "fail"]
+        shore = next(x for x in api.state()["round"]["drafts"] if x["contact"]["last"] == "Shore")
+        assert shore["template"] == "en" and shore["body"].startswith("Dear David Shore,")
+
+        # Claude looks the missing address up; it is shown, not used, until the reviewer says so
+        look = _as_claude(api, "research")
+        assert look["payload"]["contacts"][0]["missing"] == ["email"]
+        cid = look["payload"]["contacts"][0]["contact_id"]
+        bad = api.call("/api/jobs/%s/result" % look["id"], {"found": [{"contact_id": cid, "email": "p.lindner@bergkamm.example"}]})[1]
+        assert not bad["ok"] and "source" in bad["problems"][0]           # where it was found must be said
+        found = {"contact_id": cid, "email": "p.lindner@bergkamm.example", "first": "Petra", "last": "Lindner",
+                 "gender": "f", "role": "Partnerin", "greeting": "Sehr geehrte Frau Lindner,",
+                 "source": "https://bergkamm.example/team", "confidence": "high", "note": "Team page"}
+        assert api.call("/api/jobs/%s/result" % look["id"], {"found": [found]})[1]["ok"]
+        d = api.draft(cid)
+        assert d["status"] == "pending" and d["to"] == "" and d["research"]["status"] == "found"
+        assert ("research", "fail") in ids(d["checks"])
+        assert api.call("/api/draft/update", {"round_id": rid, "contact_id": cid, "change": {"status": "approved"}})[0] == 400
+        assert api.call("/api/draft/accept-research", {"round_id": rid, "contact_id": cid})[0] == 200
+        d = api.draft(cid)
+        assert d["to"] == "p.lindner@bergkamm.example" and d["body"].startswith("Sehr geehrte Frau Lindner,\n\n")
+        assert d["research"]["accepted"] and d["level"] != "fail", d["checks"]
+        assert "p.lindner" not in open(book, "rb").read().decode("latin-1")      # the list is never written to
+
+        # one email without the file, another with one more
+        api.call("/api/attachments/remove", {"target": "draft", "round_id": rid, "contact_id": shore["contact_id"],
+                                             "id": added["added"][0]["id"]})
+        api.call("/api/attachments/add", {"target": "draft", "round_id": rid, "contact_id": hagen["contact_id"],
+                                          "files": [{"name": "Investmentkriterien.pdf", "data": base64.b64encode(b"criteria").decode()}]})
+        assert api.draft(shore["contact_id"])["attachments"] == []
+        assert [a["name"] for a in api.draft(hagen["contact_id"])["attachments"]] == ["AGC Teaser.pdf", "Investmentkriterien.pdf"]
+
+        api.call("/api/draft/approve-all", {"round_id": rid})
+        going = [x["contact_id"] for x in api.state()["round"]["drafts"] if x["status"] == "approved"]
+        assert cid in going and hagen["contact_id"] in going
+        api.call("/api/send", {"round_id": rid, "ids": going, "confirm": True})
+        api.until(lambda s: not s["sending"]["active"], 60)
+        sent = {m["to"]: m for m in outlook._fake_box()["sent"]}
+        assert sent["mh@lindengrund.example"]["attachments"] == ["AGC Teaser.pdf", "Investmentkriterien.pdf"]
+        assert sent["david@thamesbridge.example"]["attachments"] == []
+        assert sent["p.lindner@bergkamm.example"]["body"].startswith("Sehr geehrte Frau Lindner,")
+
+        # only the first answer: a second message in the same thread is left alone
+        hm = sent["mh@lindengrund.example"]
+        box = outlook._fake_box()
+        first_at = store.stamp(store.now() + dt.timedelta(minutes=1))
+        box["inbox"] = [{"kind": "reply", "from_email": hm["to"], "from_name": "H", "received": first_at,
+                         "subject": "AW: " + hm["subject"], "text": "Wir hätten ein Unternehmen im Kopf.",
+                         "conversation_id": hm["conversation_id"]}]
+        store.write_json(outlook._fake_path(), box)
+        api.call("/api/replies/check", {})
+        api.until(lambda s: not s["checking"]["active"] and s["checking"]["last"])
+        job = _as_claude(api, "classify")
+        assert len(job["payload"]["answers"]) == 1 and len(job["payload"]["answers"][0]["messages"]) == 1
+        api.call("/api/jobs/%s/result" % job["id"], {"answers": [{"round_id": rid, "contact_id": hagen["contact_id"],
+                                                                 "outcome": "lead", "summary": "Has a company in mind.",
+                                                                 "quote": "", "next_step": "Call."}]})
+        box = outlook._fake_box()
+        box["inbox"].append({"kind": "reply", "from_email": hm["to"], "from_name": "H",
+                             "received": store.stamp(store.now() + dt.timedelta(minutes=2)), "subject": "AW: AW: x",
+                             "text": "Und noch etwas: rufen Sie mich an.", "conversation_id": hm["conversation_id"]})
+        store.write_json(outlook._fake_path(), box)
+        api.call("/api/replies/check", {})
+        api.until(lambda s: not s["checking"]["active"])
+        assert not [j for j in api.state()["jobs"] if j["type"] == "classify"]
+        row = next(r for r in next(x for x in api.state()["rounds"] if x["id"] == rid)["rows"] if r["contact_id"] == hagen["contact_id"])
+        assert row["outcome"] == "lead" and row["summary"] == "Has a company in mind."
+
+        # "refer to the email from last week": Claude gets what was written with this address
+        api.call("/api/settings", {"filters": {"countries": ["GB"]}})
+        assert [c["last"] for c in api.state()["contacts"] if c["included"]] == []      # Shore was written to today
+        api.call("/api/settings", {"filters": {"countries": []}})
+        for c in api.state()["contacts"]:
+            if c["last"] == "Pöschl":
+                api.call("/api/override", {"contact_id": c["id"], "included": True})
+        api.call("/api/settings", {"personalize": False})
+        api.call("/api/round/start", {})
+        rnd2 = api.state()["round"]
+        target = next(x for x in rnd2["drafts"] if x["contact"]["last"] == "Pöschl")
+        box = outlook._fake_box()
+        box["inbox"].append({"kind": "reply", "from_email": "j.poeschl@silberau.example", "from_name": "P",
+                             "received": store.stamp(store.now() - dt.timedelta(days=14)), "subject": "Deal Waldviertel",
+                             "text": "Anbei die Unterlagen zum Deal Waldviertel, Umsatz 2025 rund 40 Mio.", "conversation_id": "OLD"})
+        store.write_json(outlook._fake_path(), box)
+        api.call("/api/draft/redraft", {"round_id": rnd2["id"], "contact_id": target["contact_id"],
+                                        "note": "nimm Bezug auf die E-Mail von vor zwei Wochen zum Deal"})
+        job = _as_claude(api, "rewrite")
+        history = job["payload"]["mail_history"]
+        assert len(history) == 1 and history[0]["subject"] == "Deal Waldviertel" and history[0]["direction"] == "in"
+        body = job["payload"]["email_now"].replace("Beste Grüße", "Danke noch für die Unterlagen zum Deal Waldviertel mit rund 40 Mio. Umsatz.\n\nBeste Grüße")
+        api.call("/api/jobs/%s/result" % job["id"], {"drafts": [{"contact_id": target["contact_id"], "body": body}]})
+        d = api.draft(target["contact_id"])
+        assert ("unsupported", "warn") not in ids(d["checks"]), d["checks"]       # 40 is in the earlier email
+        # an email the note points to that is not there: Claude says so, and the email comes back unchanged
+        api.call("/api/draft/redraft", {"round_id": rnd2["id"], "contact_id": target["contact_id"],
+                                        "note": "erwähne seine Mail vom Jänner"})
+        job = _as_claude(api, "rewrite")
+        api.call("/api/jobs/%s/fail" % job["id"], {"reason": "No email from January was found."})
+        s = api.state()
+        assert api.draft(target["contact_id"])["status"] == "pending"
+        assert s["app"]["notice"].endswith("No email from January was found."), s["app"]["notice"]
+        api.call("/api/round/close", {"round_id": rnd2["id"]})
+    finally:
+        httpd.shutdown()
+        os.environ["AGC_OUTREACH_HOME"] = home_before
+
+
+@test
+def a_scheduled_round_waits_for_claude_before_sending_unreviewed():
+    home_before = os.environ["AGC_OUTREACH_HOME"]
+    os.environ["AGC_OUTREACH_HOME"] = os.path.join(TMP, "home-agc-scheduled")
+    book = os.path.join(TMP, "agc2", "Cockpit.xlsx")
+    os.makedirs(os.path.dirname(book))
+    shutil.copy(COCKPIT, book)
+    httpd, app = server.make_server()
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    api = Client(httpd, app)
+    try:
+        api.until(lambda s: s["identity"].get("ok"))
+        store.write_json(outlook._fake_path(), {"sent": [], "inbox": []})
+        api.call("/api/settings", {"workbook": book, "owner_code": "VK",
+                                   "schedule": {"mode": "quarterly", "start_date": "2027-01-15", "time": "08:00"}})
+        api.call("/api/settings", {"schedule": {"auto_send": True}})
+        result = api.call("/api/scheduled", {})[1]
+        assert result["started"] and result.get("preparing") and result["sending"] == 0, result
+        assert outlook._fake_box()["sent"] == []                      # nothing goes before Claude is done
+        job = next(j for j in iter(lambda: api.call("/api/jobs/next?wait=3")[1]["job"], None) if j["type"] == "personalize")
+        api.call("/api/jobs/%s/result" % job["id"], {"drafts": [{"contact_id": e["contact_id"], "greeting": e["rule_greeting"]}
+                                                                for e in job["payload"]["emails"]]})
+        api.until(lambda s: not s["sending"]["active"] and outlook._fake_box()["sent"], 60)
+        assert len(outlook._fake_box()["sent"]) == len(job["payload"]["emails"])
+        assert "without review" in api.state()["app"]["notice"]
+    finally:
+        api.call("/api/settings", {"schedule": {"mode": "manual"}})
+        httpd.shutdown()
+        os.environ["AGC_OUTREACH_HOME"] = home_before
 
 
 if __name__ == "__main__":

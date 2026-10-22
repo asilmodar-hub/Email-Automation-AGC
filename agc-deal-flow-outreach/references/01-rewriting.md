@@ -11,10 +11,11 @@ You hand back the whole email with that change made.
 | `note_from_user` | What the reviewer asked for, in their words |
 | `email_now` | The email as it stands, greeting included |
 | `master_email` | The sender's standard text for this contact, for comparison |
-| `greeting` | The greeting line the list gives. It stays as it is |
+| `greeting` | The greeting line settled for this person. It stays as it is |
 | `subject` | The subject line as it stands |
-| `contact` | The contact's row: name, title, company, role, type, language, Sie/du, relationship, sector, notes, and what the last round's answer was |
+| `contact` | The contact's row: name, title, company, role, type, language, Sie/du, relationship, sector, notes, city and region, comments, every other column under `extra`, and what the last round's answer was |
 | `sender` | Who the email goes out from |
+| `mail_history` | The emails between the sender and this address in the last twelve months, newest first, read from Outlook: `direction` (`in` from them, `out` from the sender), `when`, `subject`, `text` |
 
 ## What these emails are
 
@@ -50,12 +51,23 @@ line away.
 
       es war schön, Sie im Mai in Wien zu sehen. Ich melde mich …
 
-- **Facts come from the note or the row, nowhere else.** The reviewer is a
-  source: if the note says they met in May, you may say so. The row is a
-  source. Your own knowledge, guesses and anything looked up are not. If the
-  note is too thin to act on ("make it more personal") and the row gives
-  nothing honest to use, make the smallest reasonable change and do not invent
-  a shared history.
+- **Facts come from the note, the row, or the earlier emails the note points
+  to, nowhere else.** The reviewer is a source: if the note says they met in
+  May, you may say so. The row is a source. Your own knowledge, guesses and
+  anything looked up on the web are not. If the note is too thin to act on
+  ("make it more personal") and the row gives nothing honest to use, make the
+  smallest reasonable change and do not invent a shared history.
+- **When the note refers to an earlier email** ("refer to the email from two
+  weeks ago about the deal", "nimm Bezug auf seine letzte Mail"), find it in
+  `mail_history` by date and subject, and refer to what it actually says, in
+  one sentence. "Two weeks ago" is counted from today; pick the email closest
+  to it that fits the topic. Do not quote it at length and do not repeat
+  confidential figures unless the note asks for them. If no email fits, do
+  not invent one: close the job with `scripts\outreach.cmd fail <job> "No
+  email about a deal from around two weeks ago was found."` The reviewer sees
+  that sentence and the email goes back to them unchanged.
+  Otherwise `mail_history` is not yours to use: an email the note does not
+  point to stays out.
 - **Change the subject only if the note asks for it.**
 
 ## What makes a line read as generated

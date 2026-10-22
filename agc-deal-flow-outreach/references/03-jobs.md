@@ -51,6 +51,28 @@ The app answers:
 is closed either way. `"ok": false` with `problems` means the result could not
 be used at all (no body, wrong contact): correct it and submit again.
 
+`rewrite` also carries `mail_history` (the emails with this address in the
+last twelve months) for notes like "refer to the email from two weeks ago".
+
+**`personalize`** `payload`: `round_id`, `kind`, `sender` and `emails`, each
+with `contact_id`, `template`, `subject`, `email_now`, `rule_greeting` and
+`contact` (the whole row). See `05-personalizing.md`. Result:
+`{"drafts": [{"contact_id", "greeting", "body" (only if the text changed)}]}`.
+Answer: `{"ok", "problems", "still_to_do", "failed_checks"}`; several submits
+are fine, the job is done when `still_to_do` is empty.
+
+**`research`** `payload`: `round_id` and `contacts`, each the row plus
+`contact_id`, `missing` and `template`. See `06-research.md`. Result:
+`{"found": [{"contact_id", "email", "first", "last", "title", "gender", "role",
+"greeting", "source", "confidence", "note"}]}`. Answer: `{"ok", "problems",
+"still_to_do"}`.
+
+**`convert`** `payload`: `source_key`, `target_key`, `source_form`,
+`target_form`, `kind`, `subject`, `body`, `target_now`, `source_hash`. See
+`07-sie-du.md`. Result: `{"subject", "body"}`. Answer: `{"ok", "problems",
+"template_problems"}`, or `{"ok": true, "note": …}` when the user changed the
+text again meanwhile (a newer job follows).
+
 **`classify`** `payload`: `outcomes` (the allowed values) and `answers`, each
 with `round_id`, `contact_id`, `name`, `company`, `our_subject`, `our_email`,
 `matched_by` and `messages` (`received`, `subject`, `text`). See
@@ -72,7 +94,8 @@ See `04-schedule.md`.
   time you `wait`, even after the app or the session restarted. Handing back
   the same result twice is harmless.
 - **Several jobs can queue.** The reviewer may ask for changes to three emails
-  in a row. You get them one at a time, oldest first.
+  in a row, or a round may bring a `personalize` and a `research` job at once.
+  You get them one at a time, oldest first.
 - **`submit` exits with 1** when the answer has `"ok": false`. That is the
   app telling you to fix something, not a crash.
 - **A job that cannot be done** is closed with

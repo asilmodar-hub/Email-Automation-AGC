@@ -11,7 +11,10 @@ Everything lives in dev/tmp and is thrown away with --fresh.
 
 Without --live, a rule plays Claude's part. It cannot write: asked to change an
 email it puts a clearly labelled placeholder where Claude's sentence would go.
-It shows the flow, nothing more.
+It shows the flow, nothing more. In the same spirit it keeps the list's own
+greeting when asked to adjust a round to the list, finds nothing when asked to
+look a contact up online (it has no web search), and writes the other German
+version of a master email by swapping Sie and du word for word.
 
 With --live, nobody plays Claude. A real Claude session connects to the demo
 the way the skill does and answers "Ask Claude", "Check for answers" and the
@@ -65,6 +68,20 @@ ANSWERS = [
 ]
 
 
+SIE_DU = [("Ihnen", "dir"), ("Ihre", "deine"), ("Ihren", "deinen"), ("Ihrem", "deinem"), ("Ihrer", "deiner"),
+          ("Ihr", "dein"), ("Sie", "du"), ("Vielen Dank und beste Grüße", "Danke dir und liebe Grüße"),
+          ("Beste Grüße", "Liebe Grüße")]
+
+
+def swap_form(text, target):
+    """A word-for-word stand-in for the Sie/du rewrite Claude does properly."""
+    import re
+    pairs = SIE_DU if target == "du" else [(b, a) for a, b in SIE_DU]
+    for a, b in sorted(pairs, key=lambda x: -len(x[0])):
+        text = re.sub(r"(?<![\wäöüß])%s(?![\wäöüß])" % re.escape(a), b, text)
+    return text
+
+
 def play_claude(app):
     """Answer every job the way the skill would, by rule."""
     while True:
@@ -90,6 +107,18 @@ def play_claude(app):
         elif job["type"] == "schedule":
             with app.lock:
                 app.take_schedule(job, {"ok": True})
+        elif job["type"] == "personalize":
+            with app.lock:
+                app.take_personalize(job, {"drafts": [{"contact_id": e["contact_id"], "greeting": e["rule_greeting"]}
+                                                      for e in p["emails"]]})
+        elif job["type"] == "research":
+            with app.lock:
+                app.take_research(job, {"found": [{"contact_id": c["contact_id"], "email": "",
+                                                   "note": "Demo stand-in, not Claude: no web search was made."}
+                                                  for c in p["contacts"]]})
+        elif job["type"] == "convert":
+            with app.lock:
+                app.take_convert(job, {"subject": p["subject"], "body": swap_form(p["body"], p["target_form"])})
 
 
 def answer_mail():

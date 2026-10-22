@@ -158,6 +158,9 @@ def _describe(job, path):
         print("The reviewer asked for a change to the email for %s %s:"
               % (p["contact"].get("first", ""), p["contact"].get("last", "")))
         print("  \"%s\"" % p["note_from_user"])
+        if p.get("mail_history"):
+            print("The details file also holds %d earlier email%s with this address, in case the note refers to one."
+                  % (len(p["mail_history"]), "" if len(p["mail_history"]) == 1 else "s"))
         print("Read references/01-rewriting.md, then the details file.")
         print('Result file: %s   shape: {"drafts": [{"contact_id", "body"}]}' % result)
         print("Then: outreach submit %s" % job["id"])
@@ -166,6 +169,25 @@ def _describe(job, path):
         print("Read references/02-replies.md, then the details file.")
         print('Result file: %s   shape: {"answers": [{"round_id", "contact_id", "outcome", "summary", '
               '"quote", "next_step"}]}' % result)
+        print("Then: outreach submit %s" % job["id"])
+    elif job["type"] == "personalize":
+        print("A round was prepared: adjust %d email%s to what the list says about each person (the greeting "
+              "above all)." % (len(p["emails"]), "" if len(p["emails"]) == 1 else "s"))
+        print("Read references/05-personalizing.md, then the details file.")
+        print('Result file: %s   shape: {"drafts": [{"contact_id", "greeting", "body" (only if changed)}]}' % result)
+        print("Then: outreach submit %s   (several submits are fine; it prints what is still to do)" % job["id"])
+    elif job["type"] == "research":
+        print("Look up the missing address or contact person of %d contact%s online, for the reviewer to confirm."
+              % (len(p["contacts"]), "" if len(p["contacts"]) == 1 else "s"))
+        print("Read references/06-research.md, then the details file.")
+        print('Result file: %s   shape: {"found": [{"contact_id", "email", "first", "last", "title", "gender", '
+              '"role", "greeting", "source", "confidence", "note"}]}' % result)
+        print("Then: outreach submit %s" % job["id"])
+    elif job["type"] == "convert":
+        print("The user wrote the %s version of a German master email. Write the %s version from it."
+              % (p["source_form"], p["target_form"]))
+        print("Read references/07-sie-du.md, then the details file.")
+        print('Result file: %s   shape: {"subject", "body"}' % result)
         print("Then: outreach submit %s" % job["id"])
     elif job["type"] == "schedule":
         print("The user changed the automatic rhythm to: %s." % p["label"])

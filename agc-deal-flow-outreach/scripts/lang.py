@@ -30,6 +30,8 @@ EXACT = {
     "email address looks wrong": "E-Mail-Adresse sieht falsch aus",
     "no name": "kein Name",
     "language not given, German assumed": "Sprache nicht angegeben, Deutsch angenommen",
+    "language not given, English assumed from the country": "Sprache nicht angegeben, nach dem Land Englisch angenommen",
+    "first name taken from the email address": "Vorname aus der E-Mail-Adresse übernommen",
     "Sie/du not given, Sie assumed": "Sie/du nicht angegeben, Sie angenommen",
     # who is in the round
     "due": "fällig",
@@ -37,6 +39,12 @@ EXACT = {
     "marked do not contact in the list": "in der Liste als „nicht kontaktieren“ markiert",
     "asked not to be contacted": "möchte nicht mehr angeschrieben werden",
     "cadence set to never": "Rhythmus steht auf „nie“",
+    "nobody is responsible for this contact in the list": "laut Liste ist niemand für diesen Kontakt zuständig",
+    "outside your region filter": "außerhalb Ihres Regionen-Filters",
+    "outside your priority filter": "außerhalb Ihres Prioritäten-Filters",
+    "outside your relevance filter": "außerhalb Ihres Relevanz-Filters",
+    "outside your type filter": "außerhalb Ihres Filters nach Art",
+    "Claude will look up the missing details": "Claude sucht die fehlenden Angaben heraus",
     "added by hand": "von Hand hinzugefügt",
     "left out by hand": "von Hand ausgenommen",
     "no German (Sie) master email yet": "noch keine Standard-E-Mail auf Deutsch (Sie)",
@@ -56,6 +64,17 @@ EXACT = {
     "Uses Sie, but the list says du.": "Verwendet Sie, laut Liste gilt aber du.",
     "A long dash in the changed lines; people rarely type one.":
         "Ein langer Gedankenstrich in den geänderten Zeilen; den tippt kaum jemand.",
+    "No contact person in the list, so the greeting is a neutral one.":
+        "Die Liste nennt keine Ansprechperson, daher ist die Anrede neutral.",
+    "Claude found these details online. Check them and press “Use these details” before this email can be approved.":
+        "Claude hat diese Angaben online gefunden. Bitte prüfen und „Diese Angaben verwenden“ klicken, bevor die "
+        "E-Mail freigegeben werden kann.",
+    "Claude found no reliable address online. Add one by hand or skip this person.":
+        "Claude hat online keine verlässliche Adresse gefunden. Bitte eine von Hand eintragen oder diese Person auslassen.",
+    "There is no email address for this person yet.": "Für diese Person gibt es noch keine E-Mail-Adresse.",
+    "The email address looks wrong.": "Die E-Mail-Adresse sieht falsch aus.",
+    "The text mentions an attachment, but nothing is attached.":
+        "Der Text erwähnt einen Anhang, es ist aber nichts angehängt.",
     "Herr/frau not given in the list, so the greeting is a neutral one.":
         "Herr/Frau fehlt in der Liste, daher ist die Anrede neutral.",
     "Mr/ms not given in the list, so the greeting is a neutral one.":
@@ -112,6 +131,19 @@ EXACT = {
         "Der Dateidialog konnte nicht geöffnet werden. Bitte den Pfad einfügen.",
     "This link has expired. Start the tool again from Claude.":
         "Dieser Link ist abgelaufen. Bitte das Werkzeug in Claude erneut starten.",
+    "Claude is still preparing this email. It is ready in a moment.":
+        "Claude bereitet diese E-Mail noch vor. Sie ist gleich fertig.",
+    "This is not an email address.": "Das ist keine E-Mail-Adresse.",
+    "Settle the address first: use what Claude found, enter one, or skip this person.":
+        "Bitte zuerst die Adresse klären: das Gefundene verwenden, eine eintragen oder diese Person auslassen.",
+    "This address asked not to be contacted.": "Diese Adresse möchte nicht mehr angeschrieben werden.",
+    "There is nothing found online to use for this email.": "Für diese E-Mail wurde online nichts gefunden, das sich verwenden ließe.",
+    "Another email of this round already goes to this address.":
+        "Eine andere E-Mail dieser Runde geht bereits an diese Adresse.",
+    "Everyone written to has answered; there is nothing more to look for.":
+        "Alle Angeschriebenen haben geantwortet; es gibt nichts mehr zu suchen.",
+    "Only the German versions are kept in step.": "Nur die deutschen Fassungen werden abgeglichen.",
+    "The file could not be read.": "Die Datei konnte nicht gelesen werden.",
     "Sending without review needs an automatic rhythm.":
         "Senden ohne Prüfung setzt einen automatischen Rhythmus voraus.",
 }
@@ -133,6 +165,8 @@ _STEPS = {
 
 
 def _step(text):
+    if text.startswith("attach "):
+        return "%s anzuhängen" % text[len("attach "):]
     if text.startswith("accept the address "):
         return "die Adresse %s anzunehmen" % text[len("accept the address "):]
     return _STEPS.get(text, text)
@@ -155,6 +189,23 @@ PATTERNS = [(re.compile(p, re.DOTALL), f) for p, f in [
     (r"^This file could not be read as an Excel workbook \((.*)\)\.$",
      lambda m: "Diese Datei konnte nicht als Excel-Arbeitsmappe gelesen werden (%s)." % m.group(1)),
     (r"^same email as row (\d+)$", lambda m: "gleiche E-Mail-Adresse wie in Zeile %s" % m.group(1)),
+    (r"^same email as row (\d+) of (.*)$",
+     lambda m: "gleiche E-Mail-Adresse wie in Zeile %s von %s" % (m.group(1), m.group(2))),
+    (r"^(no email address|email address looks wrong|no name): tick to have Claude look it up$",
+     lambda m: "%s: anhaken, damit Claude es heraussucht" % localize(m.group(1), "de")),
+    (r"^first contacted (\d+) days ago according to the list$",
+     lambda m: _n(m.group(1), "laut Liste vor %d Tag erstmals angeschrieben", "laut Liste vor %d Tagen erstmals angeschrieben")),
+    (r"^The greeting does not name (.*)\.$", lambda m: "Die Anrede nennt %s nicht." % m.group(1)),
+    (r"^The attachment (.*) is no longer on this computer\.$",
+     lambda m: "Der Anhang %s ist nicht mehr auf diesem Computer." % m.group(1)),
+    (r"^The file (.*) is empty\.$", lambda m: "Die Datei %s ist leer." % m.group(1)),
+    (r"^The file (.*) is larger than 20 MB, too large to send by email\.$",
+     lambda m: "Die Datei %s ist größer als 20 MB und damit zu groß für eine E-Mail." % m.group(1)),
+    (r"^Scheduled round: (\d+) emails are being adjusted to the list by Claude\. They are sent without review as "
+     r"soon as that is done, as set on the Setup tab\.$",
+     lambda m: "Geplante Runde: " + _n(m.group(1), "%d E-Mail wird", "%d E-Mails werden") +
+               " von Claude an die Liste angepasst. Danach gehen sie ohne Prüfung hinaus, wie in der Einrichtung "
+               "festgelegt."),
     (r"^belongs to (.*)$", lambda m: "gehört zu %s" % m.group(1)),
     (r"^written to (\d+) days ago$", lambda m: _n(m.group(1), "vor %d Tag angeschrieben", "vor %d Tagen angeschrieben")),
     (r"^over the batch size of (\d+), next round$",
@@ -174,6 +225,8 @@ PATTERNS = [(re.compile(p, re.DOTALL), f) for p, f in [
      lambda m: "Erwähnt „%s“, das weder in der Zeile dieses Kontakts noch in Ihrem Hinweis steht." % m.group(1)),
     (r"^Reads as generated: (.*)\.$", lambda m: "Liest sich wie generiert: %s." % m.group(1)),
     (r"^Follow-up to (.*)$", lambda m: "Nachfass-Runde zu %s" % m.group(1)),
+    (r"^Claude could not change the email for (.*?): (.*)$",
+     lambda m: "Claude konnte die E-Mail an %s nicht ändern: %s" % (m.group(1), m.group(2))),
     (r"^Scheduled run: (.*)$", lambda m: "Geplanter Lauf: " + localize(m.group(1), "de")),
     (r"^Scheduled round: (\d+) emails are ready for your review\.$",
      lambda m: "Geplante Runde: " + _n(m.group(1), "%d E-Mail liegt", "%d E-Mails liegen") + " zur Prüfung bereit."),

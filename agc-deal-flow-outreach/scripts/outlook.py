@@ -26,7 +26,8 @@ import store
 FAKE = os.environ.get("AGC_OUTREACH_FAKE") == "1"
 
 OL_MAIL_ITEM = 0
-OL_FOLDER_OUTBOX, OL_FOLDER_INBOX = 4, 6
+OL_FOLDER_OUTBOX, OL_FOLDER_SENT, OL_FOLDER_INBOX = 4, 5, 6
+PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 OL_DISCARD = 1
 OL_MINIMIZED = 1
 
@@ -209,7 +210,7 @@ def _throw_away(mail, saved):
         pass
 
 
-def _attempt(app, to, subject, body, in_window):
+def _attempt(app, to, subject, body, in_window, attachments=()):
     """Build one email and send it. in_window opens the email's own window
     first, the way a person composes; the quiet way does not show anything."""
     step, saved = "create the email", False
@@ -218,6 +219,9 @@ def _attempt(app, to, subject, body, in_window):
         step = "address the email"
         mail.To = to
         mail.Subject = subject
+        for path in attachments:
+            step = "attach %s" % os.path.basename(path)
+            mail.Attachments.Add(path)
         step = "put the text above your signature"
         combined = None
         try:
@@ -251,17 +255,17 @@ def _attempt(app, to, subject, body, in_window):
         raise SendRefused(step, exc)
 
 
-def _send(w, to, subject, body):
+def _send(w, to, subject, body, attachments=()):
     app, ns = w.connect()
     _show_outlook(app, ns)
     try:
-        conversation = _attempt(app, to, subject, body, in_window=False)
+        conversation = _attempt(app, to, subject, body, False, attachments)
     except SendRefused as first:
         if first.step != "send the email" or first.code in ("0x80004004", "0x80070005"):
             raise                 # a wrong address or a security refusal does not get better by asking twice
         # Some setups only send an email that was open in its own window.
         try:
-            conversation = _attempt(app, to, subject, body, in_window=True)
+            conversation = _attempt(app, to, subject, body, True, attachments)
         except SendRefused:
             raise first
     # Sent only counts once the email has left the Outbox. Outlook started in the
@@ -353,6 +357,77 @@ def _match(item, received, addresses, conversations):
              "conversation_id": conversation, "matched_by": "thread" if in_thread else "address"}]
 
 
+def _recipient_addresses(item):
+    out = []
+    try:
+        recipients = item.Recipients
+        for i in range(1, recipients.Count + 1):
+            r = recipients.Item(i)
+            address = ""
+            try:
+                address = r.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS) or ""
+            except Exception:
+                address = r.Address or ""
+            out.append(address.lower())
+    except Exception:
+        pass
+    return out
+
+
+def _restricted(items, dasl):
+    """The items a DASL filter lets through, or all of them if Outlook will
+    not filter (an old version, a store that is not indexed)."""
+    try:
+        return items.Restrict(dasl)
+    except Exception:
+        return items
+
+
+def _history(w, address, since, limit):
+    """Emails from and to one address since a date, newest first."""
+    _, ns = w.connect()
+    address = address.lower()
+    found = []
+
+    def read(folder, direction, date_field, dasl):
+        items = _restricted(folder.Items, dasl)
+        try:
+            items.Sort("[%s]" % date_field, True)
+        except Exception:
+            pass
+        item, looked = items.GetFirst(), 0
+        while item is not None and looked < 4000 and len(found) < limit * 3:
+            looked += 1
+            try:
+                when = _when(getattr(item, date_field))
+            except Exception:
+                item = items.GetNext()
+                continue
+            if when < since:
+                break
+            try:
+                if direction == "in":
+                    hit = _sender_address(item) == address
+                else:
+                    hit = address in (item.To or "").lower() or address in _recipient_addresses(item)
+                if hit:
+                    found.append({"direction": direction, "when": store.stamp(when), "subject": item.Subject or "",
+                                  "text": strip_quoted(item.Body or "", 1500)})
+            except Exception:
+                pass
+            item = items.GetNext()
+
+    quoted = address.replace("'", "''")
+    for folder in _folders(ns.GetDefaultFolder(OL_FOLDER_INBOX)):
+        read(folder, "in", "ReceivedTime",
+             "@SQL=\"urn:schemas:httpmail:fromemail\" LIKE '%%%s%%'" % quoted)
+    read(ns.GetDefaultFolder(OL_FOLDER_SENT), "out", "SentOn",
+         "@SQL=\"urn:schemas:httpmail:displayto\" LIKE '%%%s%%' OR "
+         "\"http://schemas.microsoft.com/mapi/proptag/0x0E04001F\" LIKE '%%%s%%'" % (quoted, quoted))
+    found.sort(key=lambda m: m["when"], reverse=True)
+    return found[:limit]
+
+
 # ---- the stand-in -----------------------------------------------------------
 
 def _fake_path():
@@ -363,13 +438,16 @@ def _fake_box():
     return store.read_json(_fake_path(), {"sent": [], "inbox": []})
 
 
-def _fake_send(to, subject, body):
+def _fake_send(to, subject, body, attachments=()):
     if "bounce-now" in to:
         raise ValueError("Outlook does not accept the address %s" % to)
+    for path in attachments:
+        if not os.path.isfile(path):
+            raise ValueError("Outlook refused to attach %s: the file is not there" % os.path.basename(path))
     box = _fake_box()
     conversation = uuid.uuid4().hex.upper()
     box["sent"].append({"to": to, "subject": subject, "body": body, "conversation_id": conversation,
-                        "sent_at": store.stamp()})
+                        "sent_at": store.stamp(), "attachments": [os.path.basename(p) for p in attachments]})
     store.write_json(_fake_path(), box)
     return {"conversation_id": conversation, "state": "sent", "sent_at": store.stamp()}
 
@@ -387,6 +465,21 @@ def _fake_scan(since, addresses, conversations):
     return out
 
 
+def _fake_history(address, since, limit):
+    box = _fake_box()
+    out = []
+    for m in box["sent"]:
+        if m["to"].lower() == address and (store.parse_stamp(m["sent_at"]) or store.now()) >= since:
+            out.append({"direction": "out", "when": m["sent_at"], "subject": m["subject"],
+                        "text": strip_quoted(m["body"], 1500)})
+    for m in box["inbox"] + box.get("archive", []):
+        if m.get("from_email", "").lower() == address and (store.parse_stamp(m.get("received", "")) or store.now()) >= since:
+            out.append({"direction": "in", "when": m["received"], "subject": m["subject"],
+                        "text": strip_quoted(m.get("text", ""), 1500)})
+    out.sort(key=lambda m: m["when"], reverse=True)
+    return out[:limit]
+
+
 # ---- what the rest of the tool calls ----------------------------------------
 
 def identity():
@@ -402,12 +495,14 @@ def identity():
                            % _plain(exc)}
 
 
-def send(to, subject, body):
-    """Send one email. Returns {conversation_id, state, sent_at}; raises on failure."""
+def send(to, subject, body, attachments=()):
+    """Send one email, with the files at these paths attached. Returns
+    {conversation_id, state, sent_at}; raises on failure."""
+    attachments = list(attachments)
     if FAKE:
-        return _fake_send(to, subject, body)
+        return _fake_send(to, subject, body, attachments)
     try:
-        return call(_send, to, subject, body)
+        return call(_send, to, subject, body, attachments)
     except SendRefused as exc:
         raise RuntimeError(str(exc))
     except Exception as exc:
@@ -420,3 +515,19 @@ def scan(since, addresses, conversations):
     if FAKE:
         return _fake_scan(since, addresses, set(conversations))
     return call(_scan, since, addresses, set(conversations), timeout=600)
+
+
+def history(address, days=365, limit=15):
+    """The emails exchanged with one address in the last `days`, newest first:
+    [{direction: in|out, when, subject, text}]. Empty when Outlook cannot be
+    read; looking back is a help for Claude, never a reason to fail."""
+    address = (address or "").strip().lower()
+    if not address:
+        return []
+    since = store.now() - dt.timedelta(days=days)
+    try:
+        if FAKE:
+            return _fake_history(address, since, limit)
+        return call(_history, address, since, limit, timeout=240)
+    except Exception:
+        return []
